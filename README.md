@@ -4,6 +4,8 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/bnomei/zeuxis/ci.yml?branch=main)](https://github.com/bnomei/zeuxis/actions/workflows/ci.yml)
 [![Crates.io Downloads](https://img.shields.io/crates/d/zeuxis)](https://crates.io/crates/zeuxis)
 [![License](https://img.shields.io/crates/l/zeuxis)](https://crates.io/crates/zeuxis)
+[![Discord](https://flat.badgen.net/badge/discord/bnomei?color=7289da&icon=discord&label)](https://discordapp.com/users/bnomei)
+[![Buymecoffee](https://flat.badgen.net/badge/icon/donate?icon=buymeacoffee&color=FF813F&label)](https://www.buymeacoffee.com/bnomei)
 
 Zeuxis is a local, read-only MCP screenshot server that lets AI agents capture screenshots themselves.
 
