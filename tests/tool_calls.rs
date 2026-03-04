@@ -84,6 +84,8 @@ async fn tool_calls_diagnose_runtime_returns_structured_diagnostics() {
     assert_eq!(result.is_error, Some(false));
     let structured = result.structured_content.expect("structured content");
     assert!(structured.get("os").is_some());
+    assert!(structured.get("permission_checked").is_some());
+    assert!(structured.get("permission_check_mode").is_some());
     assert!(structured.get("permission_ok").is_some());
     assert!(structured.get("monitors_ok").is_some());
     assert!(structured.get("cursor_ok").is_some());
@@ -413,5 +415,61 @@ async fn tool_calls_capture_screen_times_out_backend_worker() {
 
     assert_eq!(result.is_error, Some(true));
     assert_eq!(extract_error_code(&result), "storage_failed");
+    tokio::time::sleep(Duration::from_millis(80)).await;
     assert_eq!(harness.storage.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn tool_calls_capture_screen_times_out_while_waiting_for_capture_slot() {
+    let harness = create_test_harness_with_parallelism_and_timeout(1, Duration::from_millis(80));
+    *harness.backend.screen_capture_delay.lock().expect("lock") = Some(Duration::from_millis(250));
+
+    let server_a = harness.server.clone();
+    let server_b = harness.server.clone();
+
+    let task_a = tokio::spawn(async move {
+        server_a
+            .capture_screen(Parameters(CaptureScreenParams::default()))
+            .await
+    });
+
+    for _ in 0..20 {
+        if harness
+            .backend
+            .active_screen_captures
+            .load(Ordering::SeqCst)
+            > 0
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        harness
+            .backend
+            .active_screen_captures
+            .load(Ordering::SeqCst)
+            > 0,
+        "first capture should acquire the only slot"
+    );
+
+    let result_b = server_b
+        .capture_screen(Parameters(CaptureScreenParams::default()))
+        .await
+        .expect("tool call b");
+
+    assert_eq!(result_b.is_error, Some(true));
+    assert_eq!(extract_error_code(&result_b), "storage_failed");
+    let error_message = result_b
+        .structured_content
+        .as_ref()
+        .and_then(|value| value.get("message"))
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    assert!(
+        error_message.contains("capture slot acquisition timed out"),
+        "unexpected error message: {error_message}"
+    );
+
+    let _ = task_a.await.expect("join task a").expect("tool call a");
 }

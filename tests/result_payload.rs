@@ -258,6 +258,13 @@ async fn result_payload_diagnose_runtime_reports_component_failures_without_tool
 
     assert_eq!(result.is_error, Some(false));
     let structured = result.structured_content.expect("structured content");
+    assert!(structured.get("permission_checked").is_some());
+    assert!(
+        structured
+            .get("permission_check_mode")
+            .and_then(|v| v.as_str())
+            .is_some()
+    );
     assert_eq!(
         structured.get("permission_ok").and_then(|v| v.as_bool()),
         Some(false)

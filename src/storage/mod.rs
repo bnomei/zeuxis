@@ -11,6 +11,7 @@ use image::{DynamicImage, RgbaImage};
 use sha2::{Digest, Sha256};
 use tempfile::Builder;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tracing::warn;
 use url::Url;
 
 use crate::{
@@ -410,8 +411,17 @@ fn prune_artifacts_in_dir(dir: &Path, current_path: &Path, policy: RetentionPoli
             break;
         };
         let victim = artifacts.remove(index);
-        if fs::remove_file(&victim.path).is_ok() {
-            total_bytes = total_bytes.saturating_sub(victim.bytes);
+        match fs::remove_file(&victim.path) {
+            Ok(()) => {
+                total_bytes = total_bytes.saturating_sub(victim.bytes);
+            }
+            Err(err) => {
+                warn!(
+                    path = %victim.path.display(),
+                    error = %err,
+                    "artifact retention prune could not remove candidate"
+                );
+            }
         }
     }
 }
@@ -555,6 +565,41 @@ mod tests {
         assert!(current.exists(), "current file should remain");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn storage_retention_keeps_candidate_when_delete_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("tempdir");
+        let oldest = write_artifact(dir.path(), "oldest", 8);
+        let current = write_artifact(dir.path(), "current", 8);
+
+        let mut perms = fs::metadata(dir.path()).expect("metadata").permissions();
+        perms.set_mode(0o500);
+        fs::set_permissions(dir.path(), perms).expect("set readonly dir");
+
+        prune_artifacts_in_dir(
+            dir.path(),
+            &current,
+            RetentionPolicy {
+                max_artifacts: 1,
+                max_total_bytes: u64::MAX,
+            },
+        );
+
+        assert!(
+            oldest.exists(),
+            "oldest file should remain when deletion fails"
+        );
+        assert!(current.exists(), "current file should remain");
+
+        let mut restore = fs::metadata(dir.path())
+            .expect("metadata after prune")
+            .permissions();
+        restore.set_mode(0o700);
+        fs::set_permissions(dir.path(), restore).expect("restore writable perms");
+    }
+
     #[test]
     fn storage_latest_artifact_returns_no_capture_yet_before_first_write() {
         let storage = TempPngStorage::new();
@@ -657,6 +702,21 @@ mod tests {
                 CaptureOutputOptions::default(),
             )
             .expect("write image");
+        assert!(artifact.path.exists());
+    }
+
+    #[test]
+    fn storage_default_constructs_and_writes_png() {
+        let storage = TempPngStorage::default();
+        let artifact = storage
+            .write_image(
+                sample_image(),
+                "capture_screen",
+                CaptureOutputOptions::default(),
+            )
+            .expect("write image");
+        assert_eq!(artifact.output_format, "png");
+        assert_eq!(artifact.mime_type, "image/png");
         assert!(artifact.path.exists());
     }
 

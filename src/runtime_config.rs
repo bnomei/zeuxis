@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use tracing::warn;
+
 pub const ENV_MAX_CONCURRENT_CAPTURES: &str = "ZEUXIS_MAX_CONCURRENT_CAPTURES";
 pub const ENV_MAX_ARTIFACTS: &str = "ZEUXIS_MAX_ARTIFACTS";
 pub const ENV_MAX_ARTIFACT_BYTES: &str = "ZEUXIS_MAX_ARTIFACT_BYTES";
@@ -113,20 +115,70 @@ fn parse_lookup_usize<F>(lookup: &F, name: &str, default: usize, min: usize, max
 where
     F: Fn(&str) -> Option<String>,
 {
-    lookup(name)
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| (*value >= min) && (*value <= max))
-        .unwrap_or(default)
+    let Some(raw) = lookup(name) else {
+        return default;
+    };
+
+    match raw.parse::<usize>() {
+        Ok(value) if (value >= min) && (value <= max) => value,
+        Ok(value) => {
+            warn!(
+                env_var = name,
+                provided = value,
+                min,
+                max,
+                fallback = default,
+                "runtime config out of range; using default"
+            );
+            default
+        }
+        Err(_) => {
+            warn!(
+                env_var = name,
+                provided = %raw,
+                min,
+                max,
+                fallback = default,
+                "runtime config parse failed; using default"
+            );
+            default
+        }
+    }
 }
 
 fn parse_lookup_u64<F>(lookup: &F, name: &str, default: u64, min: u64, max: u64) -> u64
 where
     F: Fn(&str) -> Option<String>,
 {
-    lookup(name)
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| (*value >= min) && (*value <= max))
-        .unwrap_or(default)
+    let Some(raw) = lookup(name) else {
+        return default;
+    };
+
+    match raw.parse::<u64>() {
+        Ok(value) if (value >= min) && (value <= max) => value,
+        Ok(value) => {
+            warn!(
+                env_var = name,
+                provided = value,
+                min,
+                max,
+                fallback = default,
+                "runtime config out of range; using default"
+            );
+            default
+        }
+        Err(_) => {
+            warn!(
+                env_var = name,
+                provided = %raw,
+                min,
+                max,
+                fallback = default,
+                "runtime config parse failed; using default"
+            );
+            default
+        }
+    }
 }
 
 #[cfg(test)]
@@ -189,6 +241,28 @@ mod tests {
         assert_eq!(config.max_artifact_bytes, DEFAULT_MAX_ARTIFACT_BYTES);
         assert_eq!(config.artifact_dir, None);
         assert_eq!(config.artifact_hmac_key, None);
+        assert_eq!(
+            config.blocking_task_timeout_ms,
+            DEFAULT_BLOCKING_TASK_TIMEOUT_MS
+        );
+    }
+
+    #[test]
+    fn runtime_config_from_lookup_falls_back_for_parse_errors() {
+        let config = RuntimeConfig::from_lookup(|name| match name {
+            ENV_MAX_CONCURRENT_CAPTURES => Some("not-a-number".to_owned()),
+            ENV_MAX_ARTIFACTS => Some("NaN".to_owned()),
+            ENV_MAX_ARTIFACT_BYTES => Some("bad".to_owned()),
+            ENV_BLOCKING_TASK_TIMEOUT_MS => Some("oops".to_owned()),
+            _ => None,
+        });
+
+        assert_eq!(
+            config.max_concurrent_captures,
+            DEFAULT_MAX_CONCURRENT_CAPTURES
+        );
+        assert_eq!(config.max_artifacts, DEFAULT_MAX_ARTIFACTS);
+        assert_eq!(config.max_artifact_bytes, DEFAULT_MAX_ARTIFACT_BYTES);
         assert_eq!(
             config.blocking_task_timeout_ms,
             DEFAULT_BLOCKING_TASK_TIMEOUT_MS

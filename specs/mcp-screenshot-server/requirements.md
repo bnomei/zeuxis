@@ -17,7 +17,7 @@ Implement a local, read-only MCP screenshot server in Rust that supports screen,
 - R002: The ZeuxisScreenshotServer shall expose only read-only observational tools and no system-control tools.
 - R003: The ZeuxisScreenshotServer shall validate all tool input arguments before attempting capture.
 - R004: The ZeuxisScreenshotServer shall return tool execution failures as MCP tool results with `isError=true`.
-- R004a: The ZeuxisScreenshotServer shall declare tool annotations as `readOnlyHint=true`, `destructiveHint=false`, and `idempotentHint=false`.
+- R004a: The ZeuxisScreenshotServer shall declare tool annotations as `readOnlyHint=true` and `destructiveHint=false` for every tool, with `idempotentHint=true` for `list_monitors`, `diagnose_runtime`, and `get_latest_screenshot`, and `idempotentHint=false` for capture tools.
 
 ### Tool availability and behavior
 

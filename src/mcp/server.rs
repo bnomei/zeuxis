@@ -11,7 +11,10 @@ use crate::{
     capture::{backend::CaptureBackend, xcap_backend::XcapBackend},
     cursor::{CursorProvider, DeviceQueryCursorProvider},
     platform::{PermissionGate, PlatformPermissionGate},
-    runtime_config::{MIN_MAX_CONCURRENT_CAPTURES, RuntimeConfig},
+    runtime_config::{
+        MAX_BLOCKING_TASK_TIMEOUT_MS, MIN_BLOCKING_TASK_TIMEOUT_MS, MIN_MAX_CONCURRENT_CAPTURES,
+        RuntimeConfig,
+    },
     storage::{PngStorage, TempPngStorage},
 };
 
@@ -149,6 +152,7 @@ impl ZeuxisScreenshotServer {
         feedback_emitter: Arc<dyn CaptureFeedbackEmitter>,
     ) -> Self {
         let max_concurrent_captures = max_concurrent_captures.max(MIN_MAX_CONCURRENT_CAPTURES);
+        let blocking_task_timeout = normalize_blocking_task_timeout(blocking_task_timeout);
         Self {
             backend,
             cursor_provider,
@@ -166,6 +170,14 @@ impl ZeuxisScreenshotServer {
         service.waiting().await?;
         Ok(())
     }
+}
+
+fn normalize_blocking_task_timeout(timeout: Duration) -> Duration {
+    let clamped_ms = timeout.as_millis().clamp(
+        u128::from(MIN_BLOCKING_TASK_TIMEOUT_MS),
+        u128::from(MAX_BLOCKING_TASK_TIMEOUT_MS),
+    ) as u64;
+    Duration::from_millis(clamped_ms)
 }
 
 impl Default for ZeuxisScreenshotServer {
@@ -193,10 +205,14 @@ impl ServerHandler for ZeuxisScreenshotServer {
 mod tests {
     use std::{
         path::PathBuf,
-        sync::{Arc, Mutex, OnceLock},
+        sync::{
+            Arc, Mutex, OnceLock,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     use image::{Rgba, RgbaImage};
+    use rmcp::handler::server::wrapper::Parameters;
 
     use super::*;
     use crate::{
@@ -205,10 +221,15 @@ mod tests {
             region::{GlobalRect, Point},
         },
         cursor::CursorProvider,
-        mcp::errors::ServerError,
+        mcp::{
+            errors::ServerError,
+            tools::{CaptureScreenParams, CommonCaptureParams},
+        },
         platform::PermissionGate,
         runtime_config::{
-            DEFAULT_BLOCKING_TASK_TIMEOUT_MS, ENV_MAX_CONCURRENT_CAPTURES, RuntimeConfig,
+            DEFAULT_BLOCKING_TASK_TIMEOUT_MS, ENV_BLOCKING_TASK_TIMEOUT_MS,
+            ENV_MAX_CONCURRENT_CAPTURES, MAX_BLOCKING_TASK_TIMEOUT_MS,
+            MIN_BLOCKING_TASK_TIMEOUT_MS, RuntimeConfig,
         },
         storage::{CaptureOutputFormat, CaptureOutputOptions, PngStorage, StoredArtifact},
     };
@@ -318,6 +339,17 @@ mod tests {
                 height: 2,
                 captured_at_utc: "2026-01-01T00:00:00Z".to_owned(),
             })
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct CountingFeedbackEmitter {
+        calls: AtomicUsize,
+    }
+
+    impl CaptureFeedbackEmitter for CountingFeedbackEmitter {
+        fn emit(&self) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -471,6 +503,37 @@ mod tests {
     }
 
     #[test]
+    fn mcp_server_timeout_limits_are_clamped() {
+        let min_server = ZeuxisScreenshotServer::with_components_and_limits(
+            Arc::new(DummyBackend),
+            Arc::new(DummyCursor),
+            Arc::new(DummyPermission),
+            Arc::new(DummyStorage),
+            1,
+            Duration::from_millis(0),
+            Arc::new(TerminalBellFeedbackEmitter),
+        );
+        assert_eq!(
+            min_server.blocking_task_timeout,
+            Duration::from_millis(MIN_BLOCKING_TASK_TIMEOUT_MS)
+        );
+
+        let max_server = ZeuxisScreenshotServer::with_components_and_limits(
+            Arc::new(DummyBackend),
+            Arc::new(DummyCursor),
+            Arc::new(DummyPermission),
+            Arc::new(DummyStorage),
+            1,
+            Duration::from_millis(MAX_BLOCKING_TASK_TIMEOUT_MS + 1),
+            Arc::new(TerminalBellFeedbackEmitter),
+        );
+        assert_eq!(
+            max_server.blocking_task_timeout,
+            Duration::from_millis(MAX_BLOCKING_TASK_TIMEOUT_MS)
+        );
+    }
+
+    #[test]
     fn mcp_server_with_components_uses_env_parallelism() {
         let _guard = env_lock().lock().expect("lock env");
         unsafe {
@@ -488,6 +551,75 @@ mod tests {
         unsafe {
             std::env::remove_var(ENV_MAX_CONCURRENT_CAPTURES);
         }
+    }
+
+    #[tokio::test]
+    async fn mcp_server_with_components_and_feedback_uses_custom_emitter_and_env_timeout() {
+        let feedback = Arc::new(CountingFeedbackEmitter::default());
+        let server = {
+            let _guard = env_lock().lock().expect("lock env");
+            unsafe {
+                std::env::set_var(ENV_BLOCKING_TASK_TIMEOUT_MS, "1700");
+            }
+
+            let server = ZeuxisScreenshotServer::with_components_and_feedback(
+                Arc::new(DummyBackend),
+                Arc::new(DummyCursor),
+                Arc::new(DummyPermission),
+                Arc::new(DummyStorage),
+                2,
+                feedback.clone(),
+            );
+
+            unsafe {
+                std::env::remove_var(ENV_BLOCKING_TASK_TIMEOUT_MS);
+            }
+            server
+        };
+
+        assert_eq!(server.blocking_task_timeout, Duration::from_millis(1700));
+
+        let result = server
+            .capture_screen(Parameters(CaptureScreenParams {
+                common: CommonCaptureParams {
+                    play_sound: Some(true),
+                    ..CommonCaptureParams::default()
+                },
+                monitor_id: None,
+            }))
+            .await
+            .expect("tool call");
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(feedback.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn mcp_server_capture_returns_storage_failed_when_capture_slots_closed() {
+        let server = ZeuxisScreenshotServer::with_components_and_limits(
+            Arc::new(DummyBackend),
+            Arc::new(DummyCursor),
+            Arc::new(DummyPermission),
+            Arc::new(DummyStorage),
+            1,
+            Duration::from_millis(DEFAULT_BLOCKING_TASK_TIMEOUT_MS),
+            Arc::new(TerminalBellFeedbackEmitter),
+        );
+        server.capture_slots.close();
+
+        let result = server
+            .capture_screen(Parameters(CaptureScreenParams::default()))
+            .await
+            .expect("tool call");
+
+        assert_eq!(result.is_error, Some(true));
+        let structured = result.structured_content.expect("structured");
+        assert_eq!(structured["error_code"], "storage_failed");
+        assert!(
+            structured["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("capture slot coordination failed")
+        );
     }
 
     #[test]

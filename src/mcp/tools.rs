@@ -153,41 +153,18 @@ impl ZeuxisScreenshotServer {
 
         let backend = Arc::clone(&self.backend);
         let timeout = self.blocking_task_timeout;
-        let monitors = match tokio::time::timeout(
+        let timeout_error_message =
+            format!("monitor listing timed out after {}ms", timeout.as_millis());
+        let monitors = match run_blocking_with_timeout(
             timeout,
-            tokio::task::spawn_blocking(move || backend.list_monitors()),
+            timeout_error_message,
+            "monitor listing worker task failed",
+            move || backend.list_monitors(),
         )
         .await
         {
-            Ok(Ok(Ok(monitors))) => monitors,
-            Ok(Ok(Err(error))) => {
-                error!(
-                    tool = "list_monitors",
-                    phase = "error",
-                    error_code = error.error_code(),
-                    message = error.message(),
-                    "tool invocation failed"
-                );
-                return Ok(result::error_result(&error));
-            }
-            Ok(Err(join_error)) => {
-                let error = ServerError::storage_failed(format!(
-                    "monitor listing worker task failed: {join_error}"
-                ));
-                error!(
-                    tool = "list_monitors",
-                    phase = "error",
-                    error_code = error.error_code(),
-                    message = error.message(),
-                    "tool invocation failed"
-                );
-                return Ok(result::error_result(&error));
-            }
-            Err(_) => {
-                let error = ServerError::storage_failed(format!(
-                    "monitor listing timed out after {}ms",
-                    timeout.as_millis()
-                ));
+            Ok(monitors) => monitors,
+            Err(error) => {
                 error!(
                     tool = "list_monitors",
                     phase = "error",
@@ -231,26 +208,21 @@ impl ZeuxisScreenshotServer {
 
         let backend = Arc::clone(&self.backend);
         let timeout = self.blocking_task_timeout;
-        let monitor_result = match tokio::time::timeout(
+        let monitor_timeout_error_message =
+            format!("monitor listing timed out after {}ms", timeout.as_millis());
+        let monitor_result = run_blocking_with_timeout(
             timeout,
-            tokio::task::spawn_blocking(move || backend.list_monitors()),
+            monitor_timeout_error_message,
+            "monitor listing worker task failed",
+            move || backend.list_monitors(),
         )
-        .await
-        {
-            Ok(Ok(result)) => result,
-            Ok(Err(join_error)) => Err(ServerError::storage_failed(format!(
-                "monitor listing worker task failed: {join_error}"
-            ))),
-            Err(_) => Err(ServerError::storage_failed(format!(
-                "monitor listing timed out after {}ms",
-                timeout.as_millis()
-            ))),
-        };
+        .await;
 
         let cursor_result = self.cursor_provider.cursor_position();
 
         let (permission_ok, permission_error_code, permission_message) =
             status_from_result(permission_result);
+        let (permission_checked, permission_check_mode) = permission_check_metadata();
         let (monitors_ok, monitors_error_code, monitors_message, monitor_count) =
             match monitor_result {
                 Ok(monitors) => (true, None, None, Some(monitors.len())),
@@ -285,6 +257,8 @@ impl ZeuxisScreenshotServer {
             xdg_session_type: env_non_empty("XDG_SESSION_TYPE"),
             display: env_non_empty("DISPLAY"),
             wayland_display: env_non_empty("WAYLAND_DISPLAY"),
+            permission_checked,
+            permission_check_mode: permission_check_mode.to_owned(),
             permission_ok,
             permission_error_code,
             permission_message,
@@ -302,6 +276,8 @@ impl ZeuxisScreenshotServer {
         info!(
             tool = "diagnose_runtime",
             phase = "complete",
+            permission_checked = payload.permission_checked,
+            permission_check_mode = %payload.permission_check_mode,
             permission_ok = payload.permission_ok,
             monitors_ok = payload.monitors_ok,
             monitor_count = ?payload.monitor_count,
@@ -336,43 +312,20 @@ impl ZeuxisScreenshotServer {
 
         let storage = Arc::clone(&self.storage);
         let timeout = self.blocking_task_timeout;
-        let artifact = match tokio::time::timeout(
+        let timeout_error_message = format!(
+            "latest screenshot timed out after {}ms",
+            timeout.as_millis()
+        );
+        let artifact = match run_blocking_with_timeout(
             timeout,
-            tokio::task::spawn_blocking(move || storage.latest_artifact()),
+            timeout_error_message,
+            "latest screenshot worker task failed",
+            move || storage.latest_artifact(),
         )
         .await
         {
-            Ok(Ok(Ok(artifact))) => artifact,
-            Ok(Ok(Err(error))) => {
-                error!(
-                    tool = "get_latest_screenshot",
-                    phase = "error",
-                    elapsed_ms = started_at.elapsed().as_millis(),
-                    error_code = error.error_code(),
-                    message = error.message(),
-                    "tool invocation failed"
-                );
-                return Ok(result::error_result(&error));
-            }
-            Ok(Err(join_error)) => {
-                let error = ServerError::storage_failed(format!(
-                    "latest screenshot worker task failed: {join_error}"
-                ));
-                error!(
-                    tool = "get_latest_screenshot",
-                    phase = "error",
-                    elapsed_ms = started_at.elapsed().as_millis(),
-                    error_code = error.error_code(),
-                    message = error.message(),
-                    "tool invocation failed"
-                );
-                return Ok(result::error_result(&error));
-            }
-            Err(_) => {
-                let error = ServerError::storage_failed(format!(
-                    "latest screenshot timed out after {}ms",
-                    timeout.as_millis()
-                ));
+            Ok(artifact) => artifact,
+            Err(error) => {
                 error!(
                     tool = "get_latest_screenshot",
                     phase = "error",
@@ -600,40 +553,92 @@ impl ZeuxisScreenshotServer {
             return result::error_result(&error);
         }
 
-        let _permit = match self.capture_slots.clone().acquire_owned().await {
-            Ok(permit) => permit,
-            Err(join_error) => {
-                let error = ServerError::storage_failed(format!(
-                    "capture slot coordination failed: {join_error}"
-                ));
-                error!(
-                    tool = capture_mode,
-                    phase = "capture_error",
-                    delay_seconds = ?requested_delay_seconds,
-                    play_sound,
-                    elapsed_ms = started_at.elapsed().as_millis(),
-                    error_code = error.error_code(),
-                    message = error.message(),
-                    "capture failed"
-                );
-                return result::error_result(&error);
-            }
-        };
-
         let backend = Arc::clone(&self.backend);
         let cursor_provider = Arc::clone(&self.cursor_provider);
         let storage = Arc::clone(&self.storage);
         let output = parsed_common.output;
         let timeout = self.blocking_task_timeout;
+        let timeout_message = format!("capture timed out after {}ms", timeout.as_millis());
+        let blocking_phase_started = Instant::now();
 
-        let artifact = match tokio::time::timeout(
-            timeout,
-            tokio::task::spawn_blocking(move || {
+        let permit =
+            match tokio::time::timeout(timeout, self.capture_slots.clone().acquire_owned()).await {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(acquire_error)) => {
+                    let error = ServerError::storage_failed(format!(
+                        "capture slot coordination failed: {acquire_error}"
+                    ));
+                    error!(
+                        tool = capture_mode,
+                        phase = "capture_error",
+                        delay_seconds = ?requested_delay_seconds,
+                        play_sound,
+                        elapsed_ms = started_at.elapsed().as_millis(),
+                        error_code = error.error_code(),
+                        message = error.message(),
+                        "capture failed"
+                    );
+                    return result::error_result(&error);
+                }
+                Err(_) => {
+                    let error = ServerError::storage_failed(format!(
+                        "capture slot acquisition timed out after {}ms",
+                        timeout.as_millis()
+                    ));
+                    error!(
+                        tool = capture_mode,
+                        phase = "capture_error",
+                        delay_seconds = ?requested_delay_seconds,
+                        play_sound,
+                        elapsed_ms = started_at.elapsed().as_millis(),
+                        error_code = error.error_code(),
+                        message = error.message(),
+                        "capture failed"
+                    );
+                    return result::error_result(&error);
+                }
+            };
+
+        let elapsed_before_worker = blocking_phase_started.elapsed();
+        let worker_timeout = timeout.saturating_sub(elapsed_before_worker);
+        if worker_timeout.is_zero() {
+            let error = ServerError::storage_failed(timeout_message.clone());
+            error!(
+                tool = capture_mode,
+                phase = "capture_error",
+                delay_seconds = ?requested_delay_seconds,
+                play_sound,
+                elapsed_ms = started_at.elapsed().as_millis(),
+                error_code = error.error_code(),
+                message = error.message(),
+                "capture failed"
+            );
+            return result::error_result(&error);
+        }
+
+        let deadline = std::time::Instant::now() + worker_timeout;
+        let timeout_message_for_worker = timeout_message.clone();
+        let artifact = match run_blocking_with_timeout(
+            worker_timeout,
+            timeout_message,
+            "capture worker task failed",
+            move || {
+                let _permit = permit;
+                if std::time::Instant::now() > deadline {
+                    return Err(ServerError::storage_failed(
+                        timeout_message_for_worker.clone(),
+                    ));
+                }
                 let image = capture_fn(&backend, &cursor_provider)?;
                 let image = match output.max_dimension {
                     Some(max_dimension) => downscale_if_needed(image, max_dimension),
                     None => image,
                 };
+                if std::time::Instant::now() > deadline {
+                    return Err(ServerError::storage_failed(
+                        timeout_message_for_worker.clone(),
+                    ));
+                }
                 storage.write_image(
                     image,
                     capture_mode,
@@ -642,45 +647,12 @@ impl ZeuxisScreenshotServer {
                         jpeg_quality: output.jpeg_quality,
                     },
                 )
-            }),
+            },
         )
         .await
         {
-            Ok(Ok(Ok(artifact))) => artifact,
-            Ok(Ok(Err(error))) => {
-                error!(
-                    tool = capture_mode,
-                    phase = "capture_error",
-                    delay_seconds = ?requested_delay_seconds,
-                    play_sound,
-                    elapsed_ms = started_at.elapsed().as_millis(),
-                    error_code = error.error_code(),
-                    message = error.message(),
-                    "capture failed"
-                );
-                return result::error_result(&error);
-            }
-            Ok(Err(join_error)) => {
-                let error = ServerError::storage_failed(format!(
-                    "capture worker task failed: {join_error}"
-                ));
-                error!(
-                    tool = capture_mode,
-                    phase = "capture_error",
-                    delay_seconds = ?requested_delay_seconds,
-                    play_sound,
-                    elapsed_ms = started_at.elapsed().as_millis(),
-                    error_code = error.error_code(),
-                    message = error.message(),
-                    "capture failed"
-                );
-                return result::error_result(&error);
-            }
-            Err(_) => {
-                let error = ServerError::storage_failed(format!(
-                    "capture timed out after {}ms",
-                    timeout.as_millis()
-                ));
+            Ok(artifact) => artifact,
+            Err(error) => {
                 error!(
                     tool = capture_mode,
                     phase = "capture_error",
@@ -846,6 +818,40 @@ fn status_from_result(result: Result<(), ServerError>) -> (bool, Option<String>,
             Some(error.message().to_owned()),
         ),
     }
+}
+
+async fn run_blocking_with_timeout<T, F>(
+    timeout: Duration,
+    timeout_error_message: String,
+    join_error_prefix: &str,
+    job: F,
+) -> Result<T, ServerError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, ServerError> + Send + 'static,
+{
+    match tokio::time::timeout(timeout, tokio::task::spawn_blocking(job)).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(join_error)) => Err(ServerError::storage_failed(format!(
+            "{join_error_prefix}: {join_error}"
+        ))),
+        Err(_) => Err(ServerError::storage_failed(timeout_error_message)),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn permission_check_metadata() -> (bool, &'static str) {
+    (false, "best_effort_unchecked")
+}
+
+#[cfg(target_os = "macos")]
+fn permission_check_metadata() -> (bool, &'static str) {
+    (true, "macos_preflight")
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn permission_check_metadata() -> (bool, &'static str) {
+    (true, "unsupported_platform")
 }
 
 fn env_non_empty(name: &str) -> Option<String> {

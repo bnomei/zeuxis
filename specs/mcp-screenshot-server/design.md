@@ -107,7 +107,8 @@ Each tool should expose:
 
 - `readOnlyHint=true`
 - `destructiveHint=false`
-- `idempotentHint=false`
+- `idempotentHint=true` for `list_monitors`, `diagnose_runtime`, and `get_latest_screenshot`
+- `idempotentHint=false` for capture tools
 
 ## Inputs
 
