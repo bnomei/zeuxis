@@ -9,10 +9,6 @@ OUT_DIR=${OUT_DIR:-dist}
 mkdir -p "$OUT_DIR"
 
 BIN_PATH="target/${TARGET}/release/${BIN_NAME}"
-if [[ -f "${BIN_PATH}.exe" ]]; then
-  echo "Windows binary detected; use scripts/package-release.ps1 instead." >&2
-  exit 1
-fi
 
 if [[ ! -f "$BIN_PATH" ]]; then
   echo "Binary not found: $BIN_PATH" >&2

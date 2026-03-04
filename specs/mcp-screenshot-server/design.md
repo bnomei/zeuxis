@@ -12,7 +12,7 @@ The design extends [docs/overview.md](/Users/bnomei/Sites/zeuxis/docs/overview.m
 - deterministic tool contract
 - explicit platform and permission failure behavior
 - local file artifact outputs that clients can consume reliably
-- clear v1 scope on macOS only, with deferred cross-platform expansion
+- clear v1 scope on macOS first-class support with Linux best-effort support
 
 ## Non-goals
 
@@ -20,7 +20,7 @@ The design extends [docs/overview.md](/Users/bnomei/Sites/zeuxis/docs/overview.m
 - video streaming and frame pipelines
 - any mouse/keyboard/window control
 - cloud upload or remote transport in v1
-- Linux/Windows implementation in v1
+- Windows implementation in v1
 
 ## Normative Excerpt (copied for implementers)
 
@@ -171,11 +171,16 @@ Specific:
 - do not auto-retry capture in the same invocation after request attempt (safer default)
 - explicit actionable error on denial after request attempt
 
-### Non-macOS platforms (v1)
+### Linux (v1 best effort)
+
+- no dedicated permission preflight gate in v1
+- behavior depends on compositor/backend availability and session state
+- map backend failures into stable error codes with actionable remediation where possible
+
+### Non-macOS/non-Linux platforms (v1)
 
 - treated as explicitly unsupported in v1
 - return `capture_unsupported_on_platform` with remediation text
-- cross-platform support remains a planned extension after v1
 
 ## Temp File Policy
 
@@ -183,6 +188,7 @@ Specific:
 - keep file after tool return so client can read it
 - do not write outside temp locations in v1
 - do not log raw image payloads
+- retention pruning is best effort and never deletes the current artifact being returned
 
 ## Error Model
 

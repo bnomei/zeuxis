@@ -3,16 +3,22 @@ mod support;
 use rmcp::handler::server::wrapper::Parameters;
 
 use support::{create_test_harness, extract_error_code};
-use zeuxis::mcp::tools::{CaptureCursorRegionParams, CaptureRectParams, CommonCaptureParams};
+use zeuxis::mcp::tools::{
+    CaptureCursorRegionParams, CaptureRectParams, CaptureScreenParams, CommonCaptureParams,
+};
 
 #[tokio::test]
 async fn mcp_tools_validation_rejects_negative_delay() {
     let harness = create_test_harness();
     let result = harness
         .server
-        .capture_screen(Parameters(CommonCaptureParams {
-            delay_seconds: Some(-1.0),
-            play_sound: None,
+        .capture_screen(Parameters(CaptureScreenParams {
+            common: CommonCaptureParams {
+                delay_seconds: Some(-1.0),
+                play_sound: None,
+                ..CommonCaptureParams::default()
+            },
+            monitor_id: None,
         }))
         .await
         .expect("tool call");
@@ -26,9 +32,13 @@ async fn mcp_tools_validation_rejects_delay_above_policy_limit() {
     let harness = create_test_harness();
     let result = harness
         .server
-        .capture_screen(Parameters(CommonCaptureParams {
-            delay_seconds: Some(31.0),
-            play_sound: None,
+        .capture_screen(Parameters(CaptureScreenParams {
+            common: CommonCaptureParams {
+                delay_seconds: Some(31.0),
+                play_sound: None,
+                ..CommonCaptureParams::default()
+            },
+            monitor_id: None,
         }))
         .await
         .expect("tool call");

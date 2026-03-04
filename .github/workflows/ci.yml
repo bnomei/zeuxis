@@ -41,3 +41,15 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Run tests
         run: cargo test --all-targets
+
+  linux-smoke:
+    name: Linux Smoke (Xvfb)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install Xvfb
+        run: sudo apt-get update && sudo apt-get install -y xvfb
+      - name: Run Linux smoke test under Xvfb
+        run: xvfb-run -a env ZEUXIS_LINUX_SMOKE=1 cargo test --test linux_smoke -- --nocapture

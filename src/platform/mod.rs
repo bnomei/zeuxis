@@ -21,10 +21,15 @@ impl PermissionGate for PlatformPermissionGate {
             evaluate_macos_permission(&api)
         }
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
+        {
+            Ok(())
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             Err(ServerError::capture_unsupported_on_platform(format!(
-                "capture is unsupported on platform '{}' in v1; macOS is required",
+                "capture is unsupported on platform '{}' in v1; macOS or Linux is required",
                 std::env::consts::OS
             )))
         }
@@ -121,13 +126,26 @@ mod tests {
         assert_eq!(api.request_calls.load(Ordering::SeqCst), 1);
     }
 
-    #[cfg(not(target_os = "macos"))]
     #[test]
-    fn platform_permissions_non_macos_returns_unsupported() {
+    fn platform_permissions_new_constructs_gate() {
+        let _gate = PlatformPermissionGate::new();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn platform_permissions_linux_returns_ok() {
+        let gate = PlatformPermissionGate::new();
+        let result = gate.ensure_capture_allowed();
+        assert!(result.is_ok());
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn platform_permissions_non_macos_non_linux_returns_unsupported() {
         let gate = PlatformPermissionGate::new();
         let error = gate
             .ensure_capture_allowed()
-            .expect_err("non-macOS should be unsupported in v1");
+            .expect_err("unsupported platforms should fail in v1");
         assert_eq!(error.error_code(), "capture_unsupported_on_platform");
     }
 }

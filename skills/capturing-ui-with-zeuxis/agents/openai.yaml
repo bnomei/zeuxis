@@ -1,0 +1,4 @@
+interface:
+  display_name: "Capturing UI with Zeuxis"
+  short_description: "Use Zeuxis to inspect UI and windows from screenshots"
+  default_prompt: "Use $capturing-ui-with-zeuxis to inspect the screen or window before proposing UI actions."

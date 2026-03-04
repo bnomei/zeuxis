@@ -32,9 +32,6 @@ jobs:
           - os: macos-15
             target: aarch64-apple-darwin
             use_cross: false
-          - os: windows-2022
-            target: x86_64-pc-windows-msvc
-            use_cross: false
 
     steps:
       - uses: actions/checkout@v5
@@ -55,23 +52,11 @@ jobs:
         shell: bash
         run: scripts/resolve-version.sh
 
-      - name: Build (unix)
-        if: runner.os != 'Windows'
+      - name: Build
         run: TARGET=${{ matrix.target }} scripts/build-release.sh
 
-      - name: Build (windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: scripts/build-release.ps1 -Target ${{ matrix.target }}
-
-      - name: Package (unix)
-        if: runner.os != 'Windows'
+      - name: Package
         run: TARGET=${{ matrix.target }} VERSION=${{ steps.version.outputs.version }} BIN_NAME=${{ env.BIN_NAME }} scripts/package-release.sh
-
-      - name: Package (windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: scripts/package-release.ps1 -Target ${{ matrix.target }} -Version ${{ steps.version.outputs.version }} -BinName ${{ env.BIN_NAME }}
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4

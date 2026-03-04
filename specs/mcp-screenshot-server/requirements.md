@@ -2,7 +2,7 @@
 
 ## Scope
 
-Implement a local, read-only MCP screenshot server in Rust that supports screen, window, and region capture and returns local PNG artifacts through MCP tool results.
+Implement a local, read-only MCP screenshot server in Rust that supports screen, window, and region capture and returns local image artifacts through MCP tool results.
 
 ## System Name
 
@@ -39,10 +39,11 @@ Implement a local, read-only MCP screenshot server in Rust that supports screen,
 
 ### Output contract
 
-- R017: The ZeuxisScreenshotServer shall encode capture artifacts as PNG files.
+- R017: The ZeuxisScreenshotServer shall encode capture artifacts as local image files (`png`, `jpeg`, or `webp`) based on validated output settings.
 - R018: The ZeuxisScreenshotServer shall include machine-readable output in `structuredContent`.
-- R019: The ZeuxisScreenshotServer shall include a `resource_link` to a `file://` URI for the PNG artifact.
+- R019: The ZeuxisScreenshotServer shall include a `resource_link` to a `file://` URI for the produced artifact.
 - R020: The ZeuxisScreenshotServer shall include `path`, `width`, `height`, and `capture_mode` in successful structured output.
+- R020a: The ZeuxisScreenshotServer shall include `captured_at_utc` as the original artifact capture timestamp in successful structured output.
 
 ### Coordinates and bounds
 
@@ -55,13 +56,16 @@ Implement a local, read-only MCP screenshot server in Rust that supports screen,
 - R023a: If macOS preflight indicates missing permission, then the ZeuxisScreenshotServer shall attempt `CGRequestScreenCaptureAccess` before returning an error.
 - R023b: After attempting `CGRequestScreenCaptureAccess`, the ZeuxisScreenshotServer shall not retry capture in the same tool invocation.
 - R024: If macOS screen-capture permission is not usable for the current invocation after the request attempt, then the ZeuxisScreenshotServer shall return `permission_denied` with remediation guidance.
-- R025: While running on a non-macOS platform in v1, the ZeuxisScreenshotServer shall return `capture_unsupported_on_platform`.
+- R025: While running on Linux in v1, the ZeuxisScreenshotServer shall operate in best-effort mode and surface backend capability/permission errors with stable error codes.
+- R025a: While running on non-macOS and non-Linux platforms in v1, the ZeuxisScreenshotServer shall return `capture_unsupported_on_platform`.
 
 ### Reliability and observability
 
 - R026: The ZeuxisScreenshotServer shall emit structured logs for tool invocation start, completion, and error paths.
 - R027: If capture backend operations fail, then the ZeuxisScreenshotServer shall preserve the causal error category in the returned error code.
 - R028: If temporary file creation or write fails, then the ZeuxisScreenshotServer shall return `storage_failed`.
+- R028a: The ZeuxisScreenshotServer shall apply a configured timeout to blocking backend/storage worker tasks and return `storage_failed` on timeout.
+- R028b: Artifact retention pruning shall be best effort and shall never delete the current artifact being returned.
 
 ### Privacy and non-goals
 

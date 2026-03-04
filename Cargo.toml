@@ -14,6 +14,7 @@ categories = ["command-line-utilities", "multimedia::images"]
 exclude = [".DS_Store", "specs/**"]
 
 [dependencies]
+clap = { version = "4.5.0", features = ["derive", "env"] }
 rmcp = { version = "1.1.0", features = ["transport-io"] }
 tokio = { version = "1.50.0", features = ["io-std", "macros", "rt", "sync", "time"] }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -23,7 +24,9 @@ thiserror = "2.0.18"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
 xcap = "0.8.3"
-image = { version = "0.25.9", default-features = false, features = ["png"] }
+image = { version = "0.25.9", default-features = false, features = ["png", "jpeg", "webp"] }
+hmac = "0.12.1"
+sha2 = "0.10.9"
 device_query = "4.0.1"
 tempfile = "3.26.0"
 time = { version = "0.3.47", features = ["formatting"] }

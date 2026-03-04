@@ -192,4 +192,36 @@ mod tests {
         assert!(!rect_contains_point(10, 10, 20, 20, Point::new(30, 29)));
         assert!(!rect_contains_point(10, 10, 20, 20, Point::new(29, 30)));
     }
+
+    #[test]
+    fn coordinate_center_square_rejects_zero_size() {
+        let error = center_square_on_cursor(Point::new(10, 10), 0).expect_err("size 0 fails");
+        assert_eq!(error.error_code(), "invalid_region");
+    }
+
+    #[test]
+    fn coordinate_mapping_rejects_zero_dimensions() {
+        let error = global_to_local_rect(
+            GlobalRect {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 1,
+            },
+            MonitorBounds {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
+        )
+        .expect_err("zero width fails");
+        assert_eq!(error.error_code(), "invalid_region");
+    }
+
+    #[test]
+    fn coordinate_rect_contains_point_rejects_zero_sized_rectangles() {
+        assert!(!rect_contains_point(0, 0, 0, 1, Point::new(0, 0)));
+        assert!(!rect_contains_point(0, 0, 1, 0, Point::new(0, 0)));
+    }
 }
