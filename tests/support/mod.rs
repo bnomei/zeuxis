@@ -10,7 +10,7 @@ use image::{Rgba, RgbaImage};
 
 use zeuxis::{
     capture::{
-        backend::{CaptureBackend, MonitorInfo},
+        backend::{CaptureBackend, MonitorInfo, WindowInfo},
         region::{GlobalRect, Point},
     },
     cursor::CursorProvider,
@@ -113,20 +113,27 @@ pub fn extract_monitor_count(result: &rmcp::model::CallToolResult) -> usize {
         .unwrap_or_default()
 }
 
+type MonitorRegionCapture = (u32, u32, u32, u32, u32);
+
 #[derive(Debug)]
 pub struct MockCaptureBackend {
     pub monitors: Mutex<Vec<MonitorInfo>>,
+    pub windows: Mutex<Vec<WindowInfo>>,
     pub monitors_error: Mutex<Option<ServerError>>,
     pub monitors_panic: Mutex<bool>,
+    pub windows_error: Mutex<Option<ServerError>>,
     pub screen_error: Mutex<Option<ServerError>>,
     pub screen_panic: Mutex<bool>,
     pub active_error: Mutex<Option<ServerError>>,
     pub window_error: Mutex<Option<ServerError>>,
     pub cursor_region_error: Mutex<Option<ServerError>>,
+    pub monitor_region_error: Mutex<Option<ServerError>>,
     pub rect_error: Mutex<Option<ServerError>>,
     pub last_screen_monitor_id: Mutex<Option<Option<u32>>>,
+    pub last_window_id: Mutex<Option<u32>>,
     pub last_window_cursor: Mutex<Option<Point>>,
     pub last_cursor_region: Mutex<Option<(Point, u32)>>,
+    pub last_monitor_region: Mutex<Option<MonitorRegionCapture>>,
     pub last_rect: Mutex<Option<GlobalRect>>,
     pub screen_capture_delay: Mutex<Option<Duration>>,
     pub active_screen_captures: AtomicUsize,
@@ -158,17 +165,45 @@ impl MockCaptureBackend {
                     is_builtin: false,
                 },
             ]),
+            windows: Mutex::new(vec![
+                WindowInfo {
+                    id: 300,
+                    title: "Editor".to_owned(),
+                    app: "Code".to_owned(),
+                    x: 10,
+                    y: 20,
+                    width: 800,
+                    height: 600,
+                    is_focused: true,
+                    is_minimized: false,
+                },
+                WindowInfo {
+                    id: 400,
+                    title: "Browser".to_owned(),
+                    app: "Safari".to_owned(),
+                    x: 900,
+                    y: 50,
+                    width: 900,
+                    height: 700,
+                    is_focused: false,
+                    is_minimized: false,
+                },
+            ]),
             monitors_error: Mutex::new(None),
             monitors_panic: Mutex::new(false),
+            windows_error: Mutex::new(None),
             screen_error: Mutex::new(None),
             screen_panic: Mutex::new(false),
             active_error: Mutex::new(None),
             window_error: Mutex::new(None),
             cursor_region_error: Mutex::new(None),
+            monitor_region_error: Mutex::new(None),
             rect_error: Mutex::new(None),
             last_screen_monitor_id: Mutex::new(None),
+            last_window_id: Mutex::new(None),
             last_window_cursor: Mutex::new(None),
             last_cursor_region: Mutex::new(None),
+            last_monitor_region: Mutex::new(None),
             last_rect: Mutex::new(None),
             screen_capture_delay: Mutex::new(None),
             active_screen_captures: AtomicUsize::new(0),
@@ -192,6 +227,13 @@ impl CaptureBackend for MockCaptureBackend {
         Ok(self.monitors.lock().expect("lock").clone())
     }
 
+    fn list_windows(&self) -> Result<Vec<WindowInfo>, ServerError> {
+        if let Some(error) = self.windows_error.lock().expect("lock").clone() {
+            return Err(error);
+        }
+        Ok(self.windows.lock().expect("lock").clone())
+    }
+
     fn capture_screen(&self, monitor_id: Option<u32>) -> Result<RgbaImage, ServerError> {
         *self.last_screen_monitor_id.lock().expect("lock") = Some(monitor_id);
         if *self.screen_panic.lock().expect("lock") {
@@ -205,6 +247,42 @@ impl CaptureBackend for MockCaptureBackend {
             update_max_atomic(&self.max_active_screen_captures, active);
             thread::sleep(delay);
             self.active_screen_captures.fetch_sub(1, Ordering::SeqCst);
+        }
+        Ok(self.image())
+    }
+
+    fn capture_window(&self, window_id: u32) -> Result<RgbaImage, ServerError> {
+        *self.last_window_id.lock().expect("lock") = Some(window_id);
+        if let Some(error) = self.window_error.lock().expect("lock").clone() {
+            return Err(error);
+        }
+
+        let exists = self
+            .windows
+            .lock()
+            .expect("lock")
+            .iter()
+            .any(|window| window.id == window_id);
+        if !exists {
+            return Err(ServerError::window_not_found(format!(
+                "window with id {window_id} not found"
+            )));
+        }
+
+        Ok(self.image())
+    }
+
+    fn capture_monitor_region(
+        &self,
+        monitor_id: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<RgbaImage, ServerError> {
+        *self.last_monitor_region.lock().expect("lock") = Some((monitor_id, x, y, width, height));
+        if let Some(error) = self.monitor_region_error.lock().expect("lock").clone() {
+            return Err(error);
         }
         Ok(self.image())
     }
@@ -290,9 +368,11 @@ pub struct MockStorage {
     pub panic_on_latest: Mutex<bool>,
     pub calls: AtomicUsize,
     pub latest_calls: AtomicUsize,
+    pub list_calls: AtomicUsize,
     pub last_mode: Mutex<Option<String>>,
     pub last_output: Mutex<Option<CaptureOutputOptions>>,
     pub latest_artifact: Mutex<Option<StoredArtifact>>,
+    pub session_artifacts: Mutex<Vec<StoredArtifact>>,
 }
 
 impl MockStorage {
@@ -304,9 +384,11 @@ impl MockStorage {
             panic_on_latest: Mutex::new(false),
             calls: AtomicUsize::new(0),
             latest_calls: AtomicUsize::new(0),
+            list_calls: AtomicUsize::new(0),
             last_mode: Mutex::new(None),
             last_output: Mutex::new(None),
             latest_artifact: Mutex::new(None),
+            session_artifacts: Mutex::new(Vec::new()),
         }
     }
 }
@@ -330,6 +412,8 @@ impl PngStorage for MockStorage {
         }
 
         let artifact = StoredArtifact {
+            artifact_id: format!("{capture_mode}.png"),
+            capture_mode: capture_mode.to_owned(),
             path: std::path::PathBuf::from(format!("/tmp/{capture_mode}.png")),
             uri: format!("file:///tmp/{capture_mode}.png"),
             output_format: output.format.as_str().to_owned(),
@@ -341,6 +425,47 @@ impl PngStorage for MockStorage {
             captured_at_utc: "2026-01-01T00:00:00Z".to_owned(),
         };
         *self.latest_artifact.lock().expect("lock") = Some(artifact.clone());
+        let mut session_artifacts = self.session_artifacts.lock().expect("lock");
+        session_artifacts.retain(|entry| entry.artifact_id != artifact.artifact_id);
+        session_artifacts.push(artifact.clone());
+        Ok(artifact)
+    }
+
+    fn adopt_artifact(
+        &self,
+        path: std::path::PathBuf,
+        capture_mode: &str,
+        output: CaptureOutputOptions,
+    ) -> Result<StoredArtifact, ServerError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        *self.last_mode.lock().expect("lock") = Some(capture_mode.to_owned());
+        *self.last_output.lock().expect("lock") = Some(output);
+        if let Some(error) = self.error.lock().expect("lock").clone() {
+            return Err(error);
+        }
+
+        let (width, height) = image::image_dimensions(&path).unwrap_or((8, 6));
+        let artifact = StoredArtifact {
+            artifact_id: path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("adopted.png")
+                .to_owned(),
+            capture_mode: capture_mode.to_owned(),
+            uri: format!("file://{}", path.display()),
+            path,
+            output_format: output.format.as_str().to_owned(),
+            mime_type: output.format.mime_type().to_owned(),
+            artifact_sha256: "00".repeat(32),
+            artifact_hmac_sha256: None,
+            width,
+            height,
+            captured_at_utc: "2026-01-01T00:00:00Z".to_owned(),
+        };
+        *self.latest_artifact.lock().expect("lock") = Some(artifact.clone());
+        let mut session_artifacts = self.session_artifacts.lock().expect("lock");
+        session_artifacts.retain(|entry| entry.artifact_id != artifact.artifact_id);
+        session_artifacts.push(artifact.clone());
         Ok(artifact)
     }
 
@@ -359,23 +484,40 @@ impl PngStorage for MockStorage {
             .clone()
             .ok_or_else(|| ServerError::no_capture_yet("no screenshot has been captured yet"))
     }
+
+    fn list_session_artifacts(&self) -> Result<Vec<StoredArtifact>, ServerError> {
+        self.list_calls.fetch_add(1, Ordering::SeqCst);
+        let mut artifacts = self.session_artifacts.lock().expect("lock").clone();
+        artifacts.sort_by(|a, b| b.captured_at_utc.cmp(&a.captured_at_utc));
+        Ok(artifacts)
+    }
+
+    fn clear_session_artifacts(&self) -> Result<usize, ServerError> {
+        let deleted = self.session_artifacts.lock().expect("lock").len();
+        self.session_artifacts.lock().expect("lock").clear();
+        self.latest_artifact.lock().expect("lock").take();
+        Ok(deleted)
+    }
 }
 
 #[derive(Debug)]
 pub struct MockFeedbackEmitter {
     pub calls: AtomicUsize,
+    pub capture_calls: AtomicUsize,
 }
 
 impl MockFeedbackEmitter {
     pub fn new() -> Self {
         Self {
             calls: AtomicUsize::new(0),
+            capture_calls: AtomicUsize::new(0),
         }
     }
 }
 
 impl CaptureFeedbackEmitter for MockFeedbackEmitter {
-    fn emit(&self) {
+    fn emit_capture(&self) {
+        self.capture_calls.fetch_add(1, Ordering::SeqCst);
         self.calls.fetch_add(1, Ordering::SeqCst);
     }
 }

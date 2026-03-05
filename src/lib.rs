@@ -4,3 +4,4 @@ pub mod mcp;
 pub mod platform;
 pub mod runtime_config;
 pub mod storage;
+pub mod worker;

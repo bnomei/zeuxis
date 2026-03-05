@@ -1,10 +1,57 @@
 use std::path::Path;
 
 use rmcp::model::{CallToolResult, Content, RawResource};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-use crate::{capture::backend::MonitorInfo, mcp::errors::ServerError, storage::StoredArtifact};
+use crate::{
+    capture::backend::{MonitorInfo, WindowInfo},
+    mcp::errors::ServerError,
+    storage::StoredArtifact,
+};
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct AppliedSettingsPayload {
+    pub output_mode: String,
+    pub output_preset: Option<String>,
+    pub jpeg_quality: Option<u8>,
+    pub max_dimension: Option<u32>,
+    pub delay_seconds_applied: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct SourceScaleFactorPayload {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CaptureRectPayload {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub coordinate_space: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CaptureTargetPayload {
+    pub monitor_id: Option<u32>,
+    pub window_id: Option<u32>,
+    pub rect: Option<CaptureRectPayload>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct CaptureContextPayload {
+    pub applied_settings: AppliedSettingsPayload,
+    pub input_units: String,
+    pub input_width: Option<u32>,
+    pub input_height: Option<u32>,
+    pub source_units: String,
+    pub source_width: u32,
+    pub source_height: u32,
+    pub target: CaptureTargetPayload,
+}
 
 #[derive(Debug, Serialize)]
 pub struct CaptureSuccessPayload {
@@ -17,7 +64,17 @@ pub struct CaptureSuccessPayload {
     pub width: u32,
     pub height: u32,
     pub capture_mode: String,
+    pub artifact_capture_mode: String,
     pub captured_at_utc: String,
+    pub applied_settings: AppliedSettingsPayload,
+    pub input_units: String,
+    pub input_width: Option<u32>,
+    pub input_height: Option<u32>,
+    pub source_units: String,
+    pub source_width: u32,
+    pub source_height: u32,
+    pub source_scale_factor: Option<SourceScaleFactorPayload>,
+    pub target: CaptureTargetPayload,
 }
 
 #[derive(Debug, Serialize)]
@@ -25,6 +82,36 @@ pub struct MonitorListPayload {
     pub monitor_count: usize,
     pub monitors: Vec<MonitorInfo>,
     pub listed_at_utc: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WindowListPayload {
+    pub id_scope: String,
+    pub snapshot_id: String,
+    pub listed_at_utc: String,
+    pub window_count: usize,
+    pub windows: Vec<WindowInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionArtifactsPayload {
+    pub artifact_count: usize,
+    pub listed_at_utc: String,
+    pub artifacts: Vec<SessionArtifactPayload>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionArtifactPayload {
+    pub artifact_id: String,
+    pub capture_mode: String,
+    pub path: String,
+    pub uri: String,
+    pub output_format: String,
+    pub mime_type: String,
+    pub width: u32,
+    pub height: u32,
+    pub captured_at_utc: String,
+    pub is_latest: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -56,7 +143,17 @@ pub struct RuntimeDiagnosticsPayload {
     pub diagnosed_at_utc: String,
 }
 
-pub fn success_result(capture_mode: &str, artifact: &StoredArtifact) -> CallToolResult {
+#[derive(Debug, Serialize)]
+pub struct ClearSessionArtifactsPayload {
+    pub deleted_artifact_count: usize,
+    pub cleared_at_utc: String,
+}
+
+pub fn success_result(
+    capture_mode: &str,
+    artifact: &StoredArtifact,
+    context: &CaptureContextPayload,
+) -> CallToolResult {
     let payload = CaptureSuccessPayload {
         path: artifact.path.display().to_string(),
         uri: artifact.uri.clone(),
@@ -67,7 +164,17 @@ pub fn success_result(capture_mode: &str, artifact: &StoredArtifact) -> CallTool
         width: artifact.width,
         height: artifact.height,
         capture_mode: capture_mode.to_owned(),
+        artifact_capture_mode: artifact.capture_mode.clone(),
         captured_at_utc: artifact.captured_at_utc.clone(),
+        applied_settings: context.applied_settings.clone(),
+        input_units: context.input_units.clone(),
+        input_width: context.input_width,
+        input_height: context.input_height,
+        source_units: context.source_units.clone(),
+        source_width: context.source_width,
+        source_height: context.source_height,
+        source_scale_factor: source_scale_factor(context),
+        target: context.target.clone(),
     };
 
     let resource_name = file_name_or_default(&artifact.path, "capture.png");
@@ -102,10 +209,83 @@ pub fn monitors_result(monitors: Vec<MonitorInfo>) -> CallToolResult {
     tool_result
 }
 
+pub fn windows_result(
+    windows: Vec<WindowInfo>,
+    snapshot_id: String,
+    id_scope: String,
+    listed_at_utc: String,
+) -> CallToolResult {
+    let payload = WindowListPayload {
+        id_scope,
+        snapshot_id,
+        listed_at_utc,
+        window_count: windows.len(),
+        windows,
+    };
+
+    let mut tool_result = CallToolResult::success(vec![Content::text(format!(
+        "Detected {} window(s)",
+        payload.window_count
+    ))]);
+    tool_result.structured_content =
+        Some(serde_json::to_value(payload).unwrap_or_else(|_| serde_json::json!({})));
+    tool_result
+}
+
+pub fn list_session_artifacts_result(
+    artifacts: Vec<StoredArtifact>,
+    latest_artifact_id: Option<String>,
+) -> CallToolResult {
+    let latest = latest_artifact_id.as_deref();
+    let items = artifacts
+        .iter()
+        .map(|artifact| SessionArtifactPayload {
+            artifact_id: artifact.artifact_id.clone(),
+            capture_mode: artifact.capture_mode.clone(),
+            path: artifact.path.display().to_string(),
+            uri: artifact.uri.clone(),
+            output_format: artifact.output_format.clone(),
+            mime_type: artifact.mime_type.clone(),
+            width: artifact.width,
+            height: artifact.height,
+            captured_at_utc: artifact.captured_at_utc.clone(),
+            is_latest: latest == Some(artifact.artifact_id.as_str()),
+        })
+        .collect::<Vec<_>>();
+
+    let payload = SessionArtifactsPayload {
+        artifact_count: items.len(),
+        listed_at_utc: now_rfc3339_utc(),
+        artifacts: items,
+    };
+
+    let mut tool_result = CallToolResult::success(vec![Content::text(format!(
+        "Found {} session artifact(s)",
+        payload.artifact_count
+    ))]);
+    tool_result.structured_content =
+        Some(serde_json::to_value(payload).unwrap_or_else(|_| serde_json::json!({})));
+    tool_result
+}
+
 pub fn diagnostics_result(payload: RuntimeDiagnosticsPayload) -> CallToolResult {
     let mut tool_result = CallToolResult::success(vec![Content::text(format!(
         "Runtime diagnostics: permission_ok={} monitors_ok={} cursor_ok={}",
         payload.permission_ok, payload.monitors_ok, payload.cursor_ok
+    ))]);
+    tool_result.structured_content =
+        Some(serde_json::to_value(payload).unwrap_or_else(|_| serde_json::json!({})));
+    tool_result
+}
+
+pub fn clear_session_artifacts_result(deleted_artifact_count: usize) -> CallToolResult {
+    let payload = ClearSessionArtifactsPayload {
+        deleted_artifact_count,
+        cleared_at_utc: now_rfc3339_utc(),
+    };
+
+    let mut tool_result = CallToolResult::success(vec![Content::text(format!(
+        "Cleared {deleted_artifact_count} session artifact(s)"
     ))]);
     tool_result.structured_content =
         Some(serde_json::to_value(payload).unwrap_or_else(|_| serde_json::json!({})));
@@ -120,6 +300,23 @@ pub fn error_result(error: &ServerError) -> CallToolResult {
     ))]);
     tool_result.structured_content = Some(error.structured_content());
     tool_result
+}
+
+fn source_scale_factor(context: &CaptureContextPayload) -> Option<SourceScaleFactorPayload> {
+    if context.source_width == 0 || context.source_height == 0 {
+        return None;
+    }
+
+    let input_width = context.input_width.unwrap_or(context.source_width);
+    let input_height = context.input_height.unwrap_or(context.source_height);
+    if input_width == 0 || input_height == 0 {
+        return None;
+    }
+
+    Some(SourceScaleFactorPayload {
+        x: context.source_width as f64 / input_width as f64,
+        y: context.source_height as f64 / input_height as f64,
+    })
 }
 
 fn now_rfc3339_utc() -> String {
@@ -139,12 +336,18 @@ fn file_name_or_default(path: &Path, default: &str) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use crate::{capture::backend::MonitorInfo, mcp::errors::ServerError, storage::StoredArtifact};
+    use crate::{
+        capture::backend::{MonitorInfo, WindowInfo},
+        mcp::errors::ServerError,
+        storage::StoredArtifact,
+    };
 
     use super::*;
 
     fn sample_artifact(path: &str) -> StoredArtifact {
         StoredArtifact {
+            artifact_id: "a1".to_owned(),
+            capture_mode: "capture_screen".to_owned(),
             path: PathBuf::from(path),
             uri: format!("file://{path}"),
             output_format: "png".to_owned(),
@@ -154,6 +357,29 @@ mod tests {
             width: 12,
             height: 8,
             captured_at_utc: "2026-01-01T00:00:00Z".to_owned(),
+        }
+    }
+
+    fn sample_context() -> CaptureContextPayload {
+        CaptureContextPayload {
+            applied_settings: AppliedSettingsPayload {
+                output_mode: "preset".to_owned(),
+                output_preset: Some("analysis".to_owned()),
+                jpeg_quality: None,
+                max_dimension: Some(2560),
+                delay_seconds_applied: Some(0.5),
+            },
+            input_units: "points".to_owned(),
+            input_width: Some(12),
+            input_height: Some(8),
+            source_units: "pixels".to_owned(),
+            source_width: 24,
+            source_height: 16,
+            target: CaptureTargetPayload {
+                monitor_id: Some(1),
+                window_id: None,
+                rect: None,
+            },
         }
     }
 
@@ -173,6 +399,31 @@ mod tests {
         let structured = result.structured_content.expect("structured");
         assert_eq!(structured["monitor_count"], 1);
         assert!(structured["listed_at_utc"].is_string());
+    }
+
+    #[test]
+    fn mcp_result_windows_result_includes_snapshot_metadata() {
+        let result = windows_result(
+            vec![WindowInfo {
+                id: 3,
+                title: "Editor".to_owned(),
+                app: "Code".to_owned(),
+                x: 10,
+                y: 20,
+                width: 800,
+                height: 600,
+                is_focused: true,
+                is_minimized: false,
+            }],
+            "snap-1".to_owned(),
+            "snapshot".to_owned(),
+            "2026-01-01T00:00:00Z".to_owned(),
+        );
+        assert_eq!(result.is_error, Some(false));
+        let structured = result.structured_content.expect("structured");
+        assert_eq!(structured["window_count"], 1);
+        assert_eq!(structured["snapshot_id"], "snap-1");
+        assert_eq!(structured["id_scope"], "snapshot");
     }
 
     #[test]
@@ -207,15 +458,52 @@ mod tests {
     }
 
     #[test]
-    fn mcp_result_success_result_falls_back_to_default_resource_name_without_filename() {
+    fn mcp_result_success_result_includes_units_and_scale_factor() {
         let artifact = sample_artifact("/");
-        let result = success_result("capture_screen", &artifact);
+        let result = success_result("capture_screen", &artifact, &sample_context());
         assert_eq!(result.is_error, Some(false));
         let structured = result.structured_content.expect("structured");
         assert_eq!(structured["capture_mode"], "capture_screen");
-        assert_eq!(structured["width"], 12);
-        assert_eq!(structured["height"], 8);
-        assert_eq!(structured["captured_at_utc"], "2026-01-01T00:00:00Z");
+        assert_eq!(structured["artifact_capture_mode"], "capture_screen");
+        assert_eq!(structured["input_units"], "points");
+        assert_eq!(structured["source_units"], "pixels");
+        assert_eq!(structured["source_scale_factor"]["x"], 2.0);
+        assert_eq!(structured["source_scale_factor"]["y"], 2.0);
+    }
+
+    #[test]
+    fn mcp_result_success_result_falls_back_to_unity_scale_without_input_dimensions() {
+        let artifact = sample_artifact("/");
+        let mut context = sample_context();
+        context.input_width = None;
+        context.input_height = None;
+
+        let result = success_result("capture_screen", &artifact, &context);
+        let structured = result.structured_content.expect("structured");
+        assert_eq!(structured["source_scale_factor"]["x"], 1.0);
+        assert_eq!(structured["source_scale_factor"]["y"], 1.0);
+    }
+
+    #[test]
+    fn mcp_result_list_session_artifacts_marks_latest_entry() {
+        let mut first = sample_artifact("/tmp/a.png");
+        first.artifact_id = "first".to_owned();
+        let mut latest = sample_artifact("/tmp/b.png");
+        latest.artifact_id = "latest".to_owned();
+
+        let result = list_session_artifacts_result(vec![latest, first], Some("latest".to_owned()));
+        assert_eq!(result.is_error, Some(false));
+        let structured = result.structured_content.expect("structured");
+        assert_eq!(structured["artifact_count"], 2);
+        assert_eq!(structured["artifacts"][0]["is_latest"], true);
+    }
+
+    #[test]
+    fn mcp_result_clear_session_artifacts_includes_deleted_count() {
+        let result = clear_session_artifacts_result(3);
+        assert_eq!(result.is_error, Some(false));
+        let structured = result.structured_content.expect("structured");
+        assert_eq!(structured["deleted_artifact_count"], 3);
     }
 
     #[test]

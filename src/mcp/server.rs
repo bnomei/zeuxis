@@ -1,4 +1,8 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use rmcp::{
     ServerHandler, ServiceExt,
@@ -8,27 +12,135 @@ use rmcp::{
 };
 
 use crate::{
-    capture::{backend::CaptureBackend, xcap_backend::XcapBackend},
+    capture::{
+        backend::{CaptureBackend, WindowInfo},
+        xcap_backend::XcapBackend,
+    },
     cursor::{CursorProvider, DeviceQueryCursorProvider},
     platform::{PermissionGate, PlatformPermissionGate},
     runtime_config::{
-        MAX_BLOCKING_TASK_TIMEOUT_MS, MIN_BLOCKING_TASK_TIMEOUT_MS, MIN_MAX_CONCURRENT_CAPTURES,
-        RuntimeConfig,
+        MAX_BLOCKING_TASK_TIMEOUT_MS, MAX_MAX_WORKER_STDOUT_BYTES, MAX_WORKER_KILL_GRACE_MS,
+        MIN_BLOCKING_TASK_TIMEOUT_MS, MIN_MAX_CONCURRENT_CAPTURES, MIN_MAX_WORKER_STDOUT_BYTES,
+        MIN_WORKER_KILL_GRACE_MS, RuntimeConfig,
     },
     storage::{PngStorage, TempPngStorage},
 };
 
 pub trait CaptureFeedbackEmitter: Send + Sync {
-    fn emit(&self);
+    fn emit_capture(&self);
 }
 
 #[derive(Debug, Default)]
 pub struct TerminalBellFeedbackEmitter;
 
 impl CaptureFeedbackEmitter for TerminalBellFeedbackEmitter {
-    fn emit(&self) {
+    fn emit_capture(&self) {
         eprint!("\x07");
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PlatformSoundFeedbackEmitter {
+    capture_sound_file: Option<PathBuf>,
+}
+
+impl PlatformSoundFeedbackEmitter {
+    pub const fn new(capture_sound_file: Option<PathBuf>) -> Self {
+        Self { capture_sound_file }
+    }
+}
+
+impl CaptureFeedbackEmitter for PlatformSoundFeedbackEmitter {
+    fn emit_capture(&self) {
+        if !try_emit_platform_feedback_sound(self.capture_sound_file.as_deref()) {
+            eprint!("\x07");
+        }
+    }
+}
+
+fn try_emit_platform_feedback_sound(capture_sound_file: Option<&std::path::Path>) -> bool {
+    if let Some(path) = capture_sound_file
+        && try_emit_custom_sound_file(path)
+    {
+        return true;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        spawn_feedback_sound_process("afplay", &["/System/Library/Sounds/Glass.aiff"])
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        return spawn_feedback_sound_process("canberra-gtk-play", &["-i", "camera-shutter"])
+            || spawn_feedback_sound_process(
+                "paplay",
+                &["/usr/share/sounds/freedesktop/stereo/camera-shutter.oga"],
+            );
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
+}
+
+fn try_emit_custom_sound_file(path: &std::path::Path) -> bool {
+    let sound_path = path.to_string_lossy().into_owned();
+    #[cfg(target_os = "macos")]
+    {
+        spawn_feedback_sound_process("afplay", &[&sound_path])
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        return spawn_feedback_sound_process("paplay", &[&sound_path])
+            || spawn_feedback_sound_process("aplay", &[&sound_path])
+            || spawn_feedback_sound_process("canberra-gtk-play", &["--file", &sound_path]);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
+}
+
+fn spawn_feedback_sound_process(command: &str, args: &[&str]) -> bool {
+    match std::process::Command::new(command)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(mut child) => {
+            std::thread::sleep(Duration::from_millis(25));
+            match child.try_wait() {
+                Ok(Some(status)) => status.success(),
+                Ok(None) => {
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                    });
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+        Err(_) => false,
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct WindowSnapshotState {
+    pub snapshot_id: String,
+    pub id_scope: String,
+    pub listed_at_utc: String,
+    pub windows: Vec<WindowInfo>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CaptureExecutionMode {
+    Inline,
+    SubprocessWorker,
 }
 
 #[derive(Clone)]
@@ -37,10 +149,28 @@ pub struct ZeuxisScreenshotServer {
     pub(crate) cursor_provider: Arc<dyn CursorProvider>,
     pub(crate) permission_gate: Arc<dyn PermissionGate>,
     pub(crate) storage: Arc<dyn PngStorage>,
+    pub(crate) last_capture_context: Arc<Mutex<Option<crate::mcp::result::CaptureContextPayload>>>,
+    pub(crate) last_window_snapshot: Arc<Mutex<Option<WindowSnapshotState>>>,
     pub(crate) capture_slots: Arc<tokio::sync::Semaphore>,
     pub(crate) blocking_task_timeout: Duration,
+    pub(crate) capture_execution_mode: CaptureExecutionMode,
+    pub(crate) worker_executable: Option<PathBuf>,
+    #[allow(dead_code)]
+    pub(crate) worker_kill_grace: Duration,
+    #[allow(dead_code)]
+    pub(crate) max_worker_stdout_bytes: u64,
     pub(crate) feedback_emitter: Arc<dyn CaptureFeedbackEmitter>,
     pub(crate) tool_router: ToolRouter<Self>,
+}
+
+struct ServerSettings {
+    max_concurrent_captures: usize,
+    blocking_task_timeout: Duration,
+    capture_execution_mode: CaptureExecutionMode,
+    worker_executable: Option<PathBuf>,
+    worker_kill_grace: Duration,
+    max_worker_stdout_bytes: u64,
+    feedback_emitter: Arc<dyn CaptureFeedbackEmitter>,
 }
 
 impl ZeuxisScreenshotServer {
@@ -49,6 +179,7 @@ impl ZeuxisScreenshotServer {
     }
 
     pub fn with_runtime_config(config: RuntimeConfig) -> Self {
+        let worker_executable = std::env::current_exe().ok();
         Self::with_components_and_settings(
             Arc::new(XcapBackend::new()),
             Arc::new(DeviceQueryCursorProvider::new()),
@@ -59,9 +190,17 @@ impl ZeuxisScreenshotServer {
                 config.artifact_dir.clone(),
                 config.artifact_hmac_key.clone(),
             )),
-            config.max_concurrent_captures,
-            Duration::from_millis(config.blocking_task_timeout_ms),
-            Arc::new(TerminalBellFeedbackEmitter),
+            ServerSettings {
+                max_concurrent_captures: config.max_concurrent_captures,
+                blocking_task_timeout: Duration::from_millis(config.blocking_task_timeout_ms),
+                capture_execution_mode: CaptureExecutionMode::SubprocessWorker,
+                worker_executable,
+                worker_kill_grace: Duration::from_millis(config.worker_kill_grace_ms),
+                max_worker_stdout_bytes: config.max_worker_stdout_bytes,
+                feedback_emitter: Arc::new(PlatformSoundFeedbackEmitter::new(
+                    config.capture_sound_file.clone(),
+                )),
+            },
         )
     }
 
@@ -77,9 +216,17 @@ impl ZeuxisScreenshotServer {
             cursor_provider,
             permission_gate,
             storage,
-            config.max_concurrent_captures,
-            Duration::from_millis(config.blocking_task_timeout_ms),
-            Arc::new(TerminalBellFeedbackEmitter),
+            ServerSettings {
+                max_concurrent_captures: config.max_concurrent_captures,
+                blocking_task_timeout: Duration::from_millis(config.blocking_task_timeout_ms),
+                capture_execution_mode: CaptureExecutionMode::Inline,
+                worker_executable: None,
+                worker_kill_grace: Duration::from_millis(config.worker_kill_grace_ms),
+                max_worker_stdout_bytes: config.max_worker_stdout_bytes,
+                feedback_emitter: Arc::new(PlatformSoundFeedbackEmitter::new(
+                    config.capture_sound_file.clone(),
+                )),
+            },
         )
     }
 
@@ -98,7 +245,9 @@ impl ZeuxisScreenshotServer {
             storage,
             max_concurrent_captures,
             Duration::from_millis(config.blocking_task_timeout_ms),
-            Arc::new(TerminalBellFeedbackEmitter),
+            Arc::new(PlatformSoundFeedbackEmitter::new(
+                config.capture_sound_file.clone(),
+            )),
         )
     }
 
@@ -131,14 +280,21 @@ impl ZeuxisScreenshotServer {
         blocking_task_timeout: Duration,
         feedback_emitter: Arc<dyn CaptureFeedbackEmitter>,
     ) -> Self {
+        let config = RuntimeConfig::from_env();
         Self::with_components_and_settings(
             backend,
             cursor_provider,
             permission_gate,
             storage,
-            max_concurrent_captures,
-            blocking_task_timeout,
-            feedback_emitter,
+            ServerSettings {
+                max_concurrent_captures,
+                blocking_task_timeout,
+                capture_execution_mode: CaptureExecutionMode::Inline,
+                worker_executable: None,
+                worker_kill_grace: Duration::from_millis(config.worker_kill_grace_ms),
+                max_worker_stdout_bytes: config.max_worker_stdout_bytes,
+                feedback_emitter,
+            },
         )
     }
 
@@ -147,20 +303,29 @@ impl ZeuxisScreenshotServer {
         cursor_provider: Arc<dyn CursorProvider>,
         permission_gate: Arc<dyn PermissionGate>,
         storage: Arc<dyn PngStorage>,
-        max_concurrent_captures: usize,
-        blocking_task_timeout: Duration,
-        feedback_emitter: Arc<dyn CaptureFeedbackEmitter>,
+        settings: ServerSettings,
     ) -> Self {
-        let max_concurrent_captures = max_concurrent_captures.max(MIN_MAX_CONCURRENT_CAPTURES);
-        let blocking_task_timeout = normalize_blocking_task_timeout(blocking_task_timeout);
+        let max_concurrent_captures = settings
+            .max_concurrent_captures
+            .max(MIN_MAX_CONCURRENT_CAPTURES);
+        let blocking_task_timeout = normalize_blocking_task_timeout(settings.blocking_task_timeout);
+        let worker_kill_grace = normalize_worker_kill_grace(settings.worker_kill_grace);
+        let max_worker_stdout_bytes =
+            normalize_max_worker_stdout_bytes(settings.max_worker_stdout_bytes);
         Self {
             backend,
             cursor_provider,
             permission_gate,
             storage,
+            last_capture_context: Arc::new(Mutex::new(None)),
+            last_window_snapshot: Arc::new(Mutex::new(None)),
             capture_slots: Arc::new(tokio::sync::Semaphore::new(max_concurrent_captures)),
             blocking_task_timeout,
-            feedback_emitter,
+            capture_execution_mode: settings.capture_execution_mode,
+            worker_executable: settings.worker_executable,
+            worker_kill_grace,
+            max_worker_stdout_bytes,
+            feedback_emitter: settings.feedback_emitter,
             tool_router: Self::build_tool_router(),
         }
     }
@@ -178,6 +343,18 @@ fn normalize_blocking_task_timeout(timeout: Duration) -> Duration {
         u128::from(MAX_BLOCKING_TASK_TIMEOUT_MS),
     ) as u64;
     Duration::from_millis(clamped_ms)
+}
+
+fn normalize_worker_kill_grace(timeout: Duration) -> Duration {
+    let clamped_ms = timeout.as_millis().clamp(
+        u128::from(MIN_WORKER_KILL_GRACE_MS),
+        u128::from(MAX_WORKER_KILL_GRACE_MS),
+    ) as u64;
+    Duration::from_millis(clamped_ms)
+}
+
+fn normalize_max_worker_stdout_bytes(max_worker_stdout_bytes: u64) -> u64 {
+    max_worker_stdout_bytes.clamp(MIN_MAX_WORKER_STDOUT_BYTES, MAX_MAX_WORKER_STDOUT_BYTES)
 }
 
 impl Default for ZeuxisScreenshotServer {
@@ -217,7 +394,7 @@ mod tests {
     use super::*;
     use crate::{
         capture::{
-            backend::{CaptureBackend, MonitorInfo},
+            backend::{CaptureBackend, MonitorInfo, WindowInfo},
             region::{GlobalRect, Point},
         },
         cursor::CursorProvider,
@@ -228,8 +405,10 @@ mod tests {
         platform::PermissionGate,
         runtime_config::{
             DEFAULT_BLOCKING_TASK_TIMEOUT_MS, ENV_BLOCKING_TASK_TIMEOUT_MS,
-            ENV_MAX_CONCURRENT_CAPTURES, MAX_BLOCKING_TASK_TIMEOUT_MS,
-            MIN_BLOCKING_TASK_TIMEOUT_MS, RuntimeConfig,
+            ENV_MAX_CONCURRENT_CAPTURES, ENV_MAX_WORKER_STDOUT_BYTES, ENV_WORKER_KILL_GRACE_MS,
+            MAX_BLOCKING_TASK_TIMEOUT_MS, MAX_MAX_WORKER_STDOUT_BYTES, MAX_WORKER_KILL_GRACE_MS,
+            MIN_BLOCKING_TASK_TIMEOUT_MS, MIN_MAX_WORKER_STDOUT_BYTES, MIN_WORKER_KILL_GRACE_MS,
+            RuntimeConfig,
         },
         storage::{CaptureOutputFormat, CaptureOutputOptions, PngStorage, StoredArtifact},
     };
@@ -256,8 +435,37 @@ mod tests {
             }])
         }
 
+        fn list_windows(&self) -> Result<Vec<WindowInfo>, ServerError> {
+            Ok(vec![WindowInfo {
+                id: 7,
+                title: "Dummy".to_owned(),
+                app: "Zeuxis".to_owned(),
+                x: 0,
+                y: 0,
+                width: 32,
+                height: 24,
+                is_focused: true,
+                is_minimized: false,
+            }])
+        }
+
         fn capture_screen(&self, _monitor_id: Option<u32>) -> Result<RgbaImage, ServerError> {
             Ok(RgbaImage::from_pixel(2, 2, Rgba([1, 2, 3, 255])))
+        }
+
+        fn capture_window(&self, _window_id: u32) -> Result<RgbaImage, ServerError> {
+            self.capture_screen(None)
+        }
+
+        fn capture_monitor_region(
+            &self,
+            _monitor_id: u32,
+            _x: u32,
+            _y: u32,
+            _width: u32,
+            _height: u32,
+        ) -> Result<RgbaImage, ServerError> {
+            self.capture_screen(None)
         }
 
         fn capture_active_window(&self) -> Result<RgbaImage, ServerError> {
@@ -315,6 +523,8 @@ mod tests {
                 CaptureOutputFormat::Webp => "webp",
             };
             Ok(StoredArtifact {
+                artifact_id: format!("{capture_mode}.{suffix}"),
+                capture_mode: capture_mode.to_owned(),
                 path: PathBuf::from(format!("/tmp/{capture_mode}.{suffix}")),
                 uri: format!("file:///tmp/{capture_mode}.{suffix}"),
                 output_format: output.format.as_str().to_owned(),
@@ -327,8 +537,36 @@ mod tests {
             })
         }
 
+        fn adopt_artifact(
+            &self,
+            path: PathBuf,
+            capture_mode: &str,
+            output: CaptureOutputOptions,
+        ) -> Result<StoredArtifact, ServerError> {
+            let (width, height) = image::image_dimensions(&path).unwrap_or((2, 2));
+            Ok(StoredArtifact {
+                artifact_id: path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("adopted.png")
+                    .to_owned(),
+                capture_mode: capture_mode.to_owned(),
+                uri: format!("file://{}", path.display()),
+                path,
+                output_format: output.format.as_str().to_owned(),
+                mime_type: output.format.mime_type().to_owned(),
+                artifact_sha256: "00".repeat(32),
+                artifact_hmac_sha256: None,
+                width,
+                height,
+                captured_at_utc: "2026-01-01T00:00:00Z".to_owned(),
+            })
+        }
+
         fn latest_artifact(&self) -> Result<StoredArtifact, ServerError> {
             Ok(StoredArtifact {
+                artifact_id: "latest.png".to_owned(),
+                capture_mode: "capture_screen".to_owned(),
                 path: PathBuf::from("/tmp/latest.png"),
                 uri: "file:///tmp/latest.png".to_owned(),
                 output_format: "png".to_owned(),
@@ -340,16 +578,24 @@ mod tests {
                 captured_at_utc: "2026-01-01T00:00:00Z".to_owned(),
             })
         }
+
+        fn list_session_artifacts(&self) -> Result<Vec<StoredArtifact>, ServerError> {
+            Ok(vec![])
+        }
+
+        fn clear_session_artifacts(&self) -> Result<usize, ServerError> {
+            Ok(0)
+        }
     }
 
     #[derive(Debug, Default)]
     struct CountingFeedbackEmitter {
-        calls: AtomicUsize,
+        capture_calls: AtomicUsize,
     }
 
     impl CaptureFeedbackEmitter for CountingFeedbackEmitter {
-        fn emit(&self) {
-            self.calls.fetch_add(1, Ordering::SeqCst);
+        fn emit_capture(&self) {
+            self.capture_calls.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -384,14 +630,29 @@ mod tests {
     #[test]
     fn mcp_server_terminal_bell_feedback_emitter_is_callable() {
         let emitter = TerminalBellFeedbackEmitter;
-        emitter.emit();
+        emitter.emit_capture();
+    }
+
+    #[test]
+    fn mcp_server_platform_sound_feedback_emitter_is_callable() {
+        let emitter = PlatformSoundFeedbackEmitter::default();
+        emitter.emit_capture();
     }
 
     #[test]
     fn mcp_server_dummy_components_are_callable_for_all_capture_paths() {
         let backend = DummyBackend;
         assert_eq!(backend.list_monitors().expect("monitors").len(), 1);
+        assert_eq!(backend.list_windows().expect("windows").len(), 1);
         assert_eq!(backend.capture_screen(None).expect("screen").width(), 2);
+        assert_eq!(backend.capture_window(7).expect("window by id").height(), 2);
+        assert_eq!(
+            backend
+                .capture_monitor_region(1, 0, 0, 1, 1)
+                .expect("monitor region")
+                .width(),
+            2
+        );
         assert_eq!(backend.capture_active_window().expect("active").height(), 2);
         assert_eq!(
             backend
@@ -473,6 +734,12 @@ mod tests {
 
         let latest = storage.latest_artifact().expect("latest");
         assert_eq!(latest.path, PathBuf::from("/tmp/latest.png"));
+        assert_eq!(
+            storage
+                .clear_session_artifacts()
+                .expect("clear session artifacts"),
+            0
+        );
     }
 
     #[test]
@@ -484,9 +751,45 @@ mod tests {
             artifact_dir: Some(PathBuf::from("/tmp/zeuxis-server-config")),
             artifact_hmac_key: Some(b"key".to_vec()),
             blocking_task_timeout_ms: DEFAULT_BLOCKING_TASK_TIMEOUT_MS,
+            capture_sound_file: Some(PathBuf::from("/tmp/capture.aiff")),
+            worker_kill_grace_ms: 900,
+            max_worker_stdout_bytes: 200_000,
         });
 
         assert_eq!(server.capture_slots.available_permits(), 7);
+        assert_eq!(server.worker_kill_grace, Duration::from_millis(900));
+        assert_eq!(server.max_worker_stdout_bytes, 200_000);
+    }
+
+    #[test]
+    fn mcp_server_worker_runtime_limits_are_clamped() {
+        let min_server = ZeuxisScreenshotServer::with_runtime_config(RuntimeConfig {
+            worker_kill_grace_ms: 0,
+            max_worker_stdout_bytes: 0,
+            ..RuntimeConfig::default()
+        });
+        assert_eq!(
+            min_server.worker_kill_grace,
+            Duration::from_millis(MIN_WORKER_KILL_GRACE_MS)
+        );
+        assert_eq!(
+            min_server.max_worker_stdout_bytes,
+            MIN_MAX_WORKER_STDOUT_BYTES
+        );
+
+        let max_server = ZeuxisScreenshotServer::with_runtime_config(RuntimeConfig {
+            worker_kill_grace_ms: MAX_WORKER_KILL_GRACE_MS + 1,
+            max_worker_stdout_bytes: MAX_MAX_WORKER_STDOUT_BYTES + 1,
+            ..RuntimeConfig::default()
+        });
+        assert_eq!(
+            max_server.worker_kill_grace,
+            Duration::from_millis(MAX_WORKER_KILL_GRACE_MS)
+        );
+        assert_eq!(
+            max_server.max_worker_stdout_bytes,
+            MAX_MAX_WORKER_STDOUT_BYTES
+        );
     }
 
     #[test]
@@ -538,6 +841,8 @@ mod tests {
         let _guard = env_lock().lock().expect("lock env");
         unsafe {
             std::env::set_var(ENV_MAX_CONCURRENT_CAPTURES, "4");
+            std::env::set_var(ENV_WORKER_KILL_GRACE_MS, "1200");
+            std::env::set_var(ENV_MAX_WORKER_STDOUT_BYTES, "300000");
         }
 
         let server = ZeuxisScreenshotServer::with_components(
@@ -547,9 +852,13 @@ mod tests {
             Arc::new(DummyStorage),
         );
         assert_eq!(server.capture_slots.available_permits(), 4);
+        assert_eq!(server.worker_kill_grace, Duration::from_millis(1200));
+        assert_eq!(server.max_worker_stdout_bytes, 300000);
 
         unsafe {
             std::env::remove_var(ENV_MAX_CONCURRENT_CAPTURES);
+            std::env::remove_var(ENV_WORKER_KILL_GRACE_MS);
+            std::env::remove_var(ENV_MAX_WORKER_STDOUT_BYTES);
         }
     }
 
@@ -560,6 +869,8 @@ mod tests {
             let _guard = env_lock().lock().expect("lock env");
             unsafe {
                 std::env::set_var(ENV_BLOCKING_TASK_TIMEOUT_MS, "1700");
+                std::env::set_var(ENV_WORKER_KILL_GRACE_MS, "800");
+                std::env::set_var(ENV_MAX_WORKER_STDOUT_BYTES, "240000");
             }
 
             let server = ZeuxisScreenshotServer::with_components_and_feedback(
@@ -573,11 +884,15 @@ mod tests {
 
             unsafe {
                 std::env::remove_var(ENV_BLOCKING_TASK_TIMEOUT_MS);
+                std::env::remove_var(ENV_WORKER_KILL_GRACE_MS);
+                std::env::remove_var(ENV_MAX_WORKER_STDOUT_BYTES);
             }
             server
         };
 
         assert_eq!(server.blocking_task_timeout, Duration::from_millis(1700));
+        assert_eq!(server.worker_kill_grace, Duration::from_millis(800));
+        assert_eq!(server.max_worker_stdout_bytes, 240000);
 
         let result = server
             .capture_screen(Parameters(CaptureScreenParams {
@@ -590,7 +905,7 @@ mod tests {
             .await
             .expect("tool call");
         assert_eq!(result.is_error, Some(false));
-        assert_eq!(feedback.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(feedback.capture_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -626,8 +941,20 @@ mod tests {
     fn mcp_server_new_and_default_construct_servers() {
         let server = ZeuxisScreenshotServer::new();
         assert!(server.capture_slots.available_permits() >= 1);
+        assert!(server.worker_kill_grace >= Duration::from_millis(MIN_WORKER_KILL_GRACE_MS));
+        assert!(server.worker_kill_grace <= Duration::from_millis(MAX_WORKER_KILL_GRACE_MS));
+        assert!(server.max_worker_stdout_bytes >= MIN_MAX_WORKER_STDOUT_BYTES);
+        assert!(server.max_worker_stdout_bytes <= MAX_MAX_WORKER_STDOUT_BYTES);
 
         let default_server = ZeuxisScreenshotServer::default();
         assert!(default_server.capture_slots.available_permits() >= 1);
+        assert!(
+            default_server.worker_kill_grace >= Duration::from_millis(MIN_WORKER_KILL_GRACE_MS)
+        );
+        assert!(
+            default_server.worker_kill_grace <= Duration::from_millis(MAX_WORKER_KILL_GRACE_MS)
+        );
+        assert!(default_server.max_worker_stdout_bytes >= MIN_MAX_WORKER_STDOUT_BYTES);
+        assert!(default_server.max_worker_stdout_bytes <= MAX_MAX_WORKER_STDOUT_BYTES);
     }
 }

@@ -1,9 +1,11 @@
 use std::{
+    collections::HashSet,
     fs,
     io::{BufReader, Read},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex},
-    time::SystemTime,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use hmac::{Hmac, Mac};
@@ -75,6 +77,8 @@ impl Default for CaptureOutputOptions {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredArtifact {
+    pub artifact_id: String,
+    pub capture_mode: String,
     pub path: PathBuf,
     pub uri: String,
     pub output_format: String,
@@ -94,15 +98,28 @@ pub trait PngStorage: Send + Sync {
         output: CaptureOutputOptions,
     ) -> Result<StoredArtifact, ServerError>;
 
+    fn adopt_artifact(
+        &self,
+        path: PathBuf,
+        capture_mode: &str,
+        output: CaptureOutputOptions,
+    ) -> Result<StoredArtifact, ServerError>;
+
     fn latest_artifact(&self) -> Result<StoredArtifact, ServerError>;
+
+    fn list_session_artifacts(&self) -> Result<Vec<StoredArtifact>, ServerError>;
+
+    fn clear_session_artifacts(&self) -> Result<usize, ServerError>;
 }
 
 #[derive(Debug, Clone)]
 pub struct TempPngStorage {
     retention_policy: RetentionPolicy,
-    artifact_dir: Option<PathBuf>,
+    artifact_dir: PathBuf,
+    auto_managed_artifact_dir: bool,
     artifact_hmac_key: Option<Vec<u8>>,
     latest_artifact_cache: Arc<Mutex<Option<StoredArtifact>>>,
+    session_artifacts: Arc<Mutex<Vec<StoredArtifact>>>,
 }
 
 impl TempPngStorage {
@@ -125,6 +142,10 @@ impl TempPngStorage {
         artifact_dir: Option<PathBuf>,
         artifact_hmac_key: Option<Vec<u8>>,
     ) -> Self {
+        let (artifact_dir, auto_managed_artifact_dir) = match artifact_dir {
+            Some(path) => (path, false),
+            None => (default_artifact_dir(), true),
+        };
         Self {
             retention_policy: RetentionPolicy {
                 max_artifacts: max_artifacts.clamp(MIN_MAX_ARTIFACTS, MAX_MAX_ARTIFACTS),
@@ -132,8 +153,10 @@ impl TempPngStorage {
                     .clamp(MIN_MAX_ARTIFACT_BYTES, MAX_MAX_ARTIFACT_BYTES),
             },
             artifact_dir,
+            auto_managed_artifact_dir,
             artifact_hmac_key,
             latest_artifact_cache: Arc::new(Mutex::new(None)),
+            session_artifacts: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -183,35 +206,36 @@ impl PngStorage for TempPngStorage {
             ServerError::storage_failed(format!("failed to keep temp file: {err}"))
         })?;
 
-        let (artifact_sha256, artifact_hmac_sha256) =
-            compute_integrity_fields(&path, self.artifact_hmac_key.as_deref())?;
+        self.finalize_artifact(path, capture_mode, output, width, height)
+    }
 
-        prune_artifacts(&path, self.retention_policy);
-
-        let uri = Url::from_file_path(&path).map_err(|_| {
+    fn adopt_artifact(
+        &self,
+        path: PathBuf,
+        capture_mode: &str,
+        output: CaptureOutputOptions,
+    ) -> Result<StoredArtifact, ServerError> {
+        let metadata = fs::metadata(&path).map_err(|err| {
             ServerError::storage_failed(format!(
-                "failed to convert path into file URI: {}",
+                "failed to inspect adopted artifact {}: {err}",
                 path.display()
             ))
         })?;
-
-        let artifact = StoredArtifact {
-            path,
-            uri: uri.to_string(),
-            output_format: output.format.as_str().to_owned(),
-            mime_type: output.format.mime_type().to_owned(),
-            artifact_sha256,
-            artifact_hmac_sha256,
-            width,
-            height,
-            captured_at_utc: now_rfc3339_utc(),
-        };
-
-        if let Ok(mut latest) = self.latest_artifact_cache.lock() {
-            *latest = Some(artifact.clone());
+        if !metadata.is_file() {
+            return Err(ServerError::storage_failed(format!(
+                "adopted artifact path is not a file: {}",
+                path.display()
+            )));
         }
 
-        Ok(artifact)
+        let (width, height) = image::image_dimensions(&path).map_err(|err| {
+            ServerError::encode_failed(format!(
+                "failed to read adopted {} dimensions: {err}",
+                output.format.as_str()
+            ))
+        })?;
+
+        self.finalize_artifact(path, capture_mode, output, width, height)
     }
 
     fn latest_artifact(&self) -> Result<StoredArtifact, ServerError> {
@@ -235,37 +259,166 @@ impl PngStorage for TempPngStorage {
 
         Ok(artifact)
     }
+
+    fn list_session_artifacts(&self) -> Result<Vec<StoredArtifact>, ServerError> {
+        let mut artifacts = self
+            .session_artifacts
+            .lock()
+            .map_err(|_| ServerError::storage_failed("session artifact cache lock poisoned"))?;
+
+        artifacts.retain(|artifact| artifact.path.exists());
+        let mut items = artifacts.clone();
+        items.sort_by(|a, b| b.captured_at_utc.cmp(&a.captured_at_utc));
+        Ok(items)
+    }
+
+    fn clear_session_artifacts(&self) -> Result<usize, ServerError> {
+        let artifacts = self
+            .session_artifacts
+            .lock()
+            .map_err(|_| ServerError::storage_failed("session artifact cache lock poisoned"))
+            .map(|mut artifacts| std::mem::take(&mut *artifacts))?;
+
+        let mut deleted = 0usize;
+        let mut cleared_paths = HashSet::with_capacity(artifacts.len());
+        for artifact in artifacts {
+            let path = artifact.path;
+            if path.exists() && fs::remove_file(&path).is_ok() {
+                deleted += 1;
+            }
+            cleared_paths.insert(path);
+        }
+
+        if let Ok(mut latest) = self.latest_artifact_cache.lock()
+            && latest
+                .as_ref()
+                .is_some_and(|artifact| cleared_paths.contains(&artifact.path))
+        {
+            *latest = None;
+        }
+
+        Ok(deleted)
+    }
 }
 
 impl TempPngStorage {
+    fn finalize_artifact(
+        &self,
+        path: PathBuf,
+        capture_mode: &str,
+        output: CaptureOutputOptions,
+        width: u32,
+        height: u32,
+    ) -> Result<StoredArtifact, ServerError> {
+        let (artifact_sha256, artifact_hmac_sha256) =
+            compute_integrity_fields(&path, self.artifact_hmac_key.as_deref())?;
+
+        prune_artifacts(&path, self.retention_policy);
+
+        let uri = Url::from_file_path(&path).map_err(|_| {
+            ServerError::storage_failed(format!(
+                "failed to convert path into file URI: {}",
+                path.display()
+            ))
+        })?;
+
+        let artifact = StoredArtifact {
+            artifact_id: path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("{capture_mode}-{}", now_rfc3339_utc())),
+            capture_mode: capture_mode.to_owned(),
+            path,
+            uri: uri.to_string(),
+            output_format: output.format.as_str().to_owned(),
+            mime_type: output.format.mime_type().to_owned(),
+            artifact_sha256,
+            artifact_hmac_sha256,
+            width,
+            height,
+            captured_at_utc: now_rfc3339_utc(),
+        };
+
+        if let Ok(mut artifacts) = self.session_artifacts.lock() {
+            artifacts.retain(|entry| entry.path != artifact.path);
+            artifacts.push(artifact.clone());
+            if artifacts.len() > self.retention_policy.max_artifacts {
+                let overflow = artifacts.len() - self.retention_policy.max_artifacts;
+                artifacts.drain(0..overflow);
+            }
+        }
+        if let Ok(mut latest) = self.latest_artifact_cache.lock() {
+            *latest = Some(artifact.clone());
+        }
+
+        Ok(artifact)
+    }
+
     fn create_temp_file(
         &self,
         prefix: &str,
         suffix: &str,
     ) -> Result<tempfile::NamedTempFile, ServerError> {
+        self.ensure_artifact_dir()?;
+
         let mut builder = Builder::new();
         builder.prefix(prefix).suffix(suffix);
 
-        match &self.artifact_dir {
-            Some(artifact_dir) => {
-                fs::create_dir_all(artifact_dir).map_err(|err| {
+        builder.tempfile_in(&self.artifact_dir).map_err(|err| {
+            ServerError::storage_failed(format!(
+                "failed to create temp file in {}: {err}",
+                self.artifact_dir.display()
+            ))
+        })
+    }
+
+    fn ensure_artifact_dir(&self) -> Result<(), ServerError> {
+        fs::create_dir_all(&self.artifact_dir).map_err(|err| {
+            ServerError::storage_failed(format!(
+                "failed to create artifact directory {}: {err}",
+                self.artifact_dir.display()
+            ))
+        })?;
+
+        #[cfg(unix)]
+        if self.auto_managed_artifact_dir {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = fs::metadata(&self.artifact_dir)
+                .map_err(|err| {
                     ServerError::storage_failed(format!(
-                        "failed to create artifact directory {}: {err}",
-                        artifact_dir.display()
+                        "failed to inspect artifact directory {}: {err}",
+                        self.artifact_dir.display()
+                    ))
+                })?
+                .permissions();
+            if permissions.mode() & 0o077 != 0 {
+                permissions.set_mode(0o700);
+                fs::set_permissions(&self.artifact_dir, permissions).map_err(|err| {
+                    ServerError::storage_failed(format!(
+                        "failed to secure artifact directory {}: {err}",
+                        self.artifact_dir.display()
                     ))
                 })?;
-                builder.tempfile_in(artifact_dir).map_err(|err| {
-                    ServerError::storage_failed(format!(
-                        "failed to create temp file in {}: {err}",
-                        artifact_dir.display()
-                    ))
-                })
             }
-            None => builder.tempfile().map_err(|err| {
-                ServerError::storage_failed(format!("failed to create temp file: {err}"))
-            }),
         }
+
+        Ok(())
     }
+}
+
+fn default_artifact_dir() -> PathBuf {
+    static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
+    let counter = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let unix_millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    std::env::temp_dir().join(format!(
+        "{ARTIFACT_PREFIX}session-{unix_millis:x}-{:x}-{counter:x}",
+        std::process::id()
+    ))
 }
 
 fn compute_integrity_fields(
@@ -637,6 +790,85 @@ mod tests {
     }
 
     #[test]
+    fn storage_clear_session_artifacts_deletes_written_files_and_resets_latest_cache() {
+        let dir = tempdir().expect("tempdir");
+        let storage = TempPngStorage::with_settings(
+            DEFAULT_MAX_ARTIFACTS,
+            DEFAULT_MAX_ARTIFACT_BYTES,
+            Some(dir.path().to_path_buf()),
+            None,
+        );
+
+        let first = storage
+            .write_image(
+                sample_image(),
+                "capture_screen",
+                CaptureOutputOptions::default(),
+            )
+            .expect("write first");
+        let second = storage
+            .write_image(
+                sample_image(),
+                "capture_rect",
+                CaptureOutputOptions::default(),
+            )
+            .expect("write second");
+
+        assert!(first.path.exists());
+        assert!(second.path.exists());
+
+        let deleted = storage
+            .clear_session_artifacts()
+            .expect("clear session artifacts");
+        assert_eq!(deleted, 2);
+        assert!(!first.path.exists());
+        assert!(!second.path.exists());
+
+        let error = storage
+            .latest_artifact()
+            .expect_err("latest artifact should be cleared");
+        assert_eq!(error.error_code(), "no_capture_yet");
+    }
+
+    #[test]
+    fn storage_session_artifact_cache_is_capped_by_retention_count() {
+        let dir = tempdir().expect("tempdir");
+        let storage = TempPngStorage::with_settings(
+            2,
+            DEFAULT_MAX_ARTIFACT_BYTES,
+            Some(dir.path().to_path_buf()),
+            None,
+        );
+
+        storage
+            .write_image(
+                sample_image(),
+                "capture_screen",
+                CaptureOutputOptions::default(),
+            )
+            .expect("write first");
+        storage
+            .write_image(
+                sample_image(),
+                "capture_rect",
+                CaptureOutputOptions::default(),
+            )
+            .expect("write second");
+        storage
+            .write_image(
+                sample_image(),
+                "capture_window",
+                CaptureOutputOptions::default(),
+            )
+            .expect("write third");
+
+        let artifacts = storage
+            .list_session_artifacts()
+            .expect("list session artifacts");
+        assert_eq!(artifacts.len(), 2);
+    }
+
+    #[test]
     fn storage_capture_output_format_metadata_matches_expected_values() {
         assert_eq!(CaptureOutputFormat::Png.as_str(), "png");
         assert_eq!(CaptureOutputFormat::Png.file_suffix(), ".png");
@@ -695,14 +927,30 @@ mod tests {
     #[test]
     fn storage_write_image_with_default_storage_uses_system_temp_dir() {
         let storage = TempPngStorage::new();
-        let artifact = storage
+        let first = storage
             .write_image(
                 sample_image(),
                 "capture_screen",
                 CaptureOutputOptions::default(),
             )
             .expect("write image");
-        assert!(artifact.path.exists());
+        let second = storage
+            .write_image(
+                sample_image(),
+                "capture_rect",
+                CaptureOutputOptions::default(),
+            )
+            .expect("write image");
+
+        assert!(first.path.exists());
+        assert!(second.path.exists());
+
+        let system_temp = std::env::temp_dir();
+        let first_parent = first.path.parent().expect("first parent");
+        let second_parent = second.path.parent().expect("second parent");
+        assert!(first_parent.starts_with(&system_temp));
+        assert_eq!(first_parent, second_parent);
+        assert_ne!(first_parent, system_temp.as_path());
     }
 
     #[test]

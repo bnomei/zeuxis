@@ -8,6 +8,9 @@ pub const ENV_MAX_ARTIFACT_BYTES: &str = "ZEUXIS_MAX_ARTIFACT_BYTES";
 pub const ENV_ARTIFACT_DIR: &str = "ZEUXIS_ARTIFACT_DIR";
 pub const ENV_ARTIFACT_HMAC_KEY: &str = "ZEUXIS_ARTIFACT_HMAC_KEY";
 pub const ENV_BLOCKING_TASK_TIMEOUT_MS: &str = "ZEUXIS_BLOCKING_TASK_TIMEOUT_MS";
+pub const ENV_CAPTURE_SOUND_FILE: &str = "ZEUXIS_CAPTURE_SOUND_FILE";
+pub const ENV_WORKER_KILL_GRACE_MS: &str = "ZEUXIS_WORKER_KILL_GRACE_MS";
+pub const ENV_MAX_WORKER_STDOUT_BYTES: &str = "ZEUXIS_MAX_WORKER_STDOUT_BYTES";
 
 pub const DEFAULT_MAX_CONCURRENT_CAPTURES: usize = 2;
 pub const MIN_MAX_CONCURRENT_CAPTURES: usize = 1;
@@ -25,6 +28,14 @@ pub const DEFAULT_BLOCKING_TASK_TIMEOUT_MS: u64 = 15_000;
 pub const MIN_BLOCKING_TASK_TIMEOUT_MS: u64 = 100;
 pub const MAX_BLOCKING_TASK_TIMEOUT_MS: u64 = 300_000;
 
+pub const DEFAULT_WORKER_KILL_GRACE_MS: u64 = 250;
+pub const MIN_WORKER_KILL_GRACE_MS: u64 = 10;
+pub const MAX_WORKER_KILL_GRACE_MS: u64 = 30_000;
+
+pub const DEFAULT_MAX_WORKER_STDOUT_BYTES: u64 = 64 * 1024;
+pub const MIN_MAX_WORKER_STDOUT_BYTES: u64 = 1024;
+pub const MAX_MAX_WORKER_STDOUT_BYTES: u64 = 4 * 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeConfig {
     pub max_concurrent_captures: usize,
@@ -33,6 +44,9 @@ pub struct RuntimeConfig {
     pub artifact_dir: Option<PathBuf>,
     pub artifact_hmac_key: Option<Vec<u8>>,
     pub blocking_task_timeout_ms: u64,
+    pub capture_sound_file: Option<PathBuf>,
+    pub worker_kill_grace_ms: u64,
+    pub max_worker_stdout_bytes: u64,
 }
 
 impl Default for RuntimeConfig {
@@ -44,6 +58,9 @@ impl Default for RuntimeConfig {
             artifact_dir: None,
             artifact_hmac_key: None,
             blocking_task_timeout_ms: DEFAULT_BLOCKING_TASK_TIMEOUT_MS,
+            capture_sound_file: None,
+            worker_kill_grace_ms: DEFAULT_WORKER_KILL_GRACE_MS,
+            max_worker_stdout_bytes: DEFAULT_MAX_WORKER_STDOUT_BYTES,
         }
     }
 }
@@ -87,6 +104,21 @@ impl RuntimeConfig {
                 DEFAULT_BLOCKING_TASK_TIMEOUT_MS,
                 MIN_BLOCKING_TASK_TIMEOUT_MS,
                 MAX_BLOCKING_TASK_TIMEOUT_MS,
+            ),
+            capture_sound_file: parse_lookup_path(&lookup, ENV_CAPTURE_SOUND_FILE),
+            worker_kill_grace_ms: parse_lookup_u64(
+                &lookup,
+                ENV_WORKER_KILL_GRACE_MS,
+                DEFAULT_WORKER_KILL_GRACE_MS,
+                MIN_WORKER_KILL_GRACE_MS,
+                MAX_WORKER_KILL_GRACE_MS,
+            ),
+            max_worker_stdout_bytes: parse_lookup_u64(
+                &lookup,
+                ENV_MAX_WORKER_STDOUT_BYTES,
+                DEFAULT_MAX_WORKER_STDOUT_BYTES,
+                MIN_MAX_WORKER_STDOUT_BYTES,
+                MAX_MAX_WORKER_STDOUT_BYTES,
             ),
         }
     }
@@ -207,6 +239,9 @@ mod tests {
             ENV_ARTIFACT_DIR => Some(" /tmp/zeuxis-artifacts ".to_owned()),
             ENV_ARTIFACT_HMAC_KEY => Some("super-secret".to_owned()),
             ENV_BLOCKING_TASK_TIMEOUT_MS => Some("2500".to_owned()),
+            ENV_CAPTURE_SOUND_FILE => Some(" /tmp/capture.aiff ".to_owned()),
+            ENV_WORKER_KILL_GRACE_MS => Some("600".to_owned()),
+            ENV_MAX_WORKER_STDOUT_BYTES => Some("131072".to_owned()),
             _ => None,
         });
 
@@ -219,6 +254,12 @@ mod tests {
         );
         assert_eq!(config.artifact_hmac_key, Some(b"super-secret".to_vec()));
         assert_eq!(config.blocking_task_timeout_ms, 2500);
+        assert_eq!(
+            config.capture_sound_file,
+            Some(PathBuf::from("/tmp/capture.aiff"))
+        );
+        assert_eq!(config.worker_kill_grace_ms, 600);
+        assert_eq!(config.max_worker_stdout_bytes, 131072);
     }
 
     #[test]
@@ -230,6 +271,9 @@ mod tests {
             ENV_ARTIFACT_DIR => Some("   ".to_owned()),
             ENV_ARTIFACT_HMAC_KEY => Some(String::new()),
             ENV_BLOCKING_TASK_TIMEOUT_MS => Some("0".to_owned()),
+            ENV_CAPTURE_SOUND_FILE => Some("   ".to_owned()),
+            ENV_WORKER_KILL_GRACE_MS => Some("0".to_owned()),
+            ENV_MAX_WORKER_STDOUT_BYTES => Some("1".to_owned()),
             _ => None,
         });
 
@@ -245,6 +289,12 @@ mod tests {
             config.blocking_task_timeout_ms,
             DEFAULT_BLOCKING_TASK_TIMEOUT_MS
         );
+        assert_eq!(config.capture_sound_file, None);
+        assert_eq!(config.worker_kill_grace_ms, DEFAULT_WORKER_KILL_GRACE_MS);
+        assert_eq!(
+            config.max_worker_stdout_bytes,
+            DEFAULT_MAX_WORKER_STDOUT_BYTES
+        );
     }
 
     #[test]
@@ -254,6 +304,8 @@ mod tests {
             ENV_MAX_ARTIFACTS => Some("NaN".to_owned()),
             ENV_MAX_ARTIFACT_BYTES => Some("bad".to_owned()),
             ENV_BLOCKING_TASK_TIMEOUT_MS => Some("oops".to_owned()),
+            ENV_WORKER_KILL_GRACE_MS => Some("invalid".to_owned()),
+            ENV_MAX_WORKER_STDOUT_BYTES => Some("invalid".to_owned()),
             _ => None,
         });
 
@@ -267,6 +319,11 @@ mod tests {
             config.blocking_task_timeout_ms,
             DEFAULT_BLOCKING_TASK_TIMEOUT_MS
         );
+        assert_eq!(config.worker_kill_grace_ms, DEFAULT_WORKER_KILL_GRACE_MS);
+        assert_eq!(
+            config.max_worker_stdout_bytes,
+            DEFAULT_MAX_WORKER_STDOUT_BYTES
+        );
     }
 
     #[test]
@@ -279,6 +336,9 @@ mod tests {
             std::env::set_var(ENV_ARTIFACT_DIR, "/tmp/zeuxis-env");
             std::env::set_var(ENV_ARTIFACT_HMAC_KEY, "hmac-key");
             std::env::set_var(ENV_BLOCKING_TASK_TIMEOUT_MS, "1700");
+            std::env::set_var(ENV_CAPTURE_SOUND_FILE, "/tmp/zeuxis-capture.aiff");
+            std::env::set_var(ENV_WORKER_KILL_GRACE_MS, "900");
+            std::env::set_var(ENV_MAX_WORKER_STDOUT_BYTES, "262144");
         }
 
         let config = RuntimeConfig::from_env();
@@ -288,6 +348,12 @@ mod tests {
         assert_eq!(config.artifact_dir, Some(PathBuf::from("/tmp/zeuxis-env")));
         assert_eq!(config.artifact_hmac_key, Some(b"hmac-key".to_vec()));
         assert_eq!(config.blocking_task_timeout_ms, 1700);
+        assert_eq!(
+            config.capture_sound_file,
+            Some(PathBuf::from("/tmp/zeuxis-capture.aiff"))
+        );
+        assert_eq!(config.worker_kill_grace_ms, 900);
+        assert_eq!(config.max_worker_stdout_bytes, 262144);
 
         unsafe {
             std::env::remove_var(ENV_MAX_CONCURRENT_CAPTURES);
@@ -296,6 +362,9 @@ mod tests {
             std::env::remove_var(ENV_ARTIFACT_DIR);
             std::env::remove_var(ENV_ARTIFACT_HMAC_KEY);
             std::env::remove_var(ENV_BLOCKING_TASK_TIMEOUT_MS);
+            std::env::remove_var(ENV_CAPTURE_SOUND_FILE);
+            std::env::remove_var(ENV_WORKER_KILL_GRACE_MS);
+            std::env::remove_var(ENV_MAX_WORKER_STDOUT_BYTES);
         }
     }
 }

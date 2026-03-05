@@ -69,54 +69,56 @@ zeuxis --version
 }
 ```
 
+### Add Zeuxis via CLI commands
+
+If you use Codex CLI:
+```bash
+codex mcp add zeuxis -- zeuxis
+codex mcp list
+```
+
+If you use Amp CLI:
+```bash
+amp mcp add zeuxis -- zeuxis
+amp mcp list
+```
+
 ## MCP Tools
 
-Zeuxis exposes:
-- `list_monitors`: discover monitors and ids.
-- `diagnose_runtime`: report capture readiness, cursor status, and session context.
-- `get_latest_screenshot`: return the latest artifact from this server session without taking a new capture.
-- `capture_screen`: full-monitor capture (best default when user says “show me what you see”).
-- `capture_active_window`: focused app window only.
-- `capture_window_at_cursor`: window under cursor.
-- `capture_cursor_region`: square around cursor.
-- `capture_rect`: exact global rectangle.
+Shared params for `capture_*` tools:
+- `delay_ms` or `delay_seconds` (use one), `play_sound`, and optional `output` settings.
+- `output` accepts either a preset string (`"analysis"|"exact"|"compact"`) or an object (`{ "mode":"preset|custom", ... }`).
 
-Monitor-aware capture:
-- `capture_screen` accepts optional `monitor_id` (from `list_monitors`).
-- If `monitor_id` is omitted, `capture_screen` uses the primary monitor.
+| Tool | Params | Description |
+| --- | --- | --- |
+| `list_monitors` | none | Lists available monitors and IDs. Use IDs with monitor-specific capture tools. |
+| `list_windows` | `focused_only?`, `include_system_windows?`, `app_contains?`, `title_contains?` | Lists windows with deterministic IDs plus snapshot metadata. Use its `snapshot_id` + `window_id` with `capture_window`. |
+| `get_runtime_diagnostics` | none | Reports runtime capture readiness (permission, monitor discovery, cursor availability). Useful as a first troubleshooting step. |
+| `get_latest_capture` | none | Returns the latest artifact captured in the current Zeuxis session without taking a new screenshot. |
+| `list_session_artifacts` | none | Lists all artifacts created in the current Zeuxis session, including `is_latest`. |
+| `clear_session_artifacts` | none | Deletes artifacts from the current Zeuxis session and resets latest-capture state. |
+| `capture_screen` | `monitor_id?` + shared capture params | Captures a full monitor (primary monitor if `monitor_id` is omitted). Good default when you need overall context. |
+| `capture_active_window` | shared capture params | Captures the currently focused window. |
+| `capture_cursor_window` | `include_system_windows?` + shared capture params | Captures the window under the cursor. By default, system/menu surfaces are excluded. |
+| `capture_window` | `snapshot_id`, `window_id` + shared capture params | Captures a specific window deterministically from a `list_windows` snapshot. |
+| `capture_cursor_region` | `size` + shared capture params | Captures a square region centered on the cursor. |
+| `capture_rect` | `x`, `y`, `width`, `height` + shared capture params | Captures an exact global desktop rectangle (logical points). |
+| `capture_monitor_region` | `monitor_id`, `x`, `y`, `width`, `height` + shared capture params | Captures a monitor-local rectangle (logical points). Best for multi-monitor workflows. |
 
-Output presets for capture tools (`capture_*`):
-- default `output_preset: "analysis"` => `png` + `max_dimension=2560`
-- `output_preset: "exact"` => `png` + no resize
-- `output_preset: "compact"` => `jpeg` + `jpeg_quality=82` + `max_dimension=1600`
-
-Optional expert overrides:
-- `output_format`: `png | jpeg | webp`
-- `jpeg_quality`: `40..95` (only when resolved output format is `jpeg`)
-- `max_dimension`: `256..8192` (long-edge cap, aspect ratio preserved)
-
-Override precedence:
-- `output_format`/`jpeg_quality`/`max_dimension` override preset defaults when provided.
-
-Successful tool results include:
-- `content` text summary
-- `content` `resource_link` to local `file://` image (`png`, `jpeg`, or `webp`)
-- `structuredContent` with `path`, `uri`, `output_format`, `mime_type`, `artifact_sha256`, `artifact_hmac_sha256`, `width`, `height`, `capture_mode`, `captured_at_utc` (original capture timestamp)
-
-Error results use `isError=true` with structured fields:
-- `error_code`
-- `message`
-- `retryable`
-
-`get_latest_screenshot` returns `no_capture_yet` until at least one successful `capture_*` call has occurred in the current Zeuxis process.
+Notes:
+- Coordinate inputs are logical desktop points; resulting image dimensions are source pixels.
+- Capture results include local `file://` artifact links plus metadata like `capture_mode`, `artifact_capture_mode`, dimensions, hashes, and `source_scale_factor`.
+- Errors are structured with `error_code`, `message`, and `retryable`.
 
 ## Runtime Safety Limits
 
+- `delay_ms` max: `30000`
 - `delay_seconds` max: `30`
 - capture dimension max: `16384 x 16384`
 - capture area max: `40,000,000` pixels
-- capture work runs on blocking workers and is gated by a semaphore
-- blocking worker timeout: configurable (`100..=300000` ms, default `15000` ms)
+- capture work runs in a dedicated subprocess worker and is gated by a semaphore
+- capture timeout is enforced in the parent process; timed-out workers are terminated and reaped before returning
+- capture timeout: configurable (`100..=300000` ms, default `15000` ms)
 
 Temp artifact retention:
 - managed files use prefix `zeuxis-` and suffix `.png`, `.jpg`, or `.webp`
@@ -133,7 +135,10 @@ Precedence is `CLI flag > env var > default` (no config files).
 | `--max-artifacts` | `ZEUXIS_MAX_ARTIFACTS` | `64` | Max retained Zeuxis temp image files (`1..=10000`). |
 | `--max-artifact-bytes` | `ZEUXIS_MAX_ARTIFACT_BYTES` | `536870912` | Max retained Zeuxis temp image bytes (`1024..=10737418240`). |
 | `--artifact-dir` | `ZEUXIS_ARTIFACT_DIR` | system temp dir | Directory for managed capture artifacts. |
-| `--blocking-task-timeout-ms` | `ZEUXIS_BLOCKING_TASK_TIMEOUT_MS` | `15000` | Timeout for blocking backend/storage workers (`100..=300000`). |
+| `--blocking-task-timeout-ms` | `ZEUXIS_BLOCKING_TASK_TIMEOUT_MS` | `15000` | Overall capture deadline before timeout/worker termination (`100..=300000`). |
+| `--worker-kill-grace-ms` | `ZEUXIS_WORKER_KILL_GRACE_MS` | `250` | Grace period to wait after soft terminate before hard-kill (`10..=30000`). |
+| `--max-worker-stdout-bytes` | `ZEUXIS_MAX_WORKER_STDOUT_BYTES` | `65536` | Max worker IPC stdout bytes accepted by parent (`1024..=4194304`). |
+| `--capture-sound-file` | `ZEUXIS_CAPTURE_SOUND_FILE` | platform default | Optional custom sound file for capture-complete feedback when `play_sound=true`. |
 | n/a | `ZEUXIS_ARTIFACT_HMAC_KEY` | unset | Optional HMAC key; when set, `artifact_hmac_sha256` is included in capture results. |
 | n/a | `RUST_LOG` | unset | Standard Rust logging filter for runtime diagnostics. |
 
@@ -149,7 +154,7 @@ Cursor-dependent tools may also require Accessibility permission because they re
 
 On Linux, Zeuxis does not run a dedicated permission preflight gate in v1. Capture behavior depends on your desktop environment/compositor and what the underlying capture backend permits.
 
-If cursor-dependent tools fail (especially on Wayland), run `diagnose_runtime` first and fall back to `capture_screen` or `capture_rect` as needed.
+If cursor-dependent tools fail (especially on Wayland), run `get_runtime_diagnostics` first and fall back to `capture_screen` or `capture_rect` as needed.
 
 ## Development
 

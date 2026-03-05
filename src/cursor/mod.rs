@@ -28,7 +28,7 @@ impl CursorProvider for DeviceQueryCursorProvider {
 fn cursor_unavailable_message() -> &'static str {
     #[cfg(target_os = "linux")]
     {
-        "cursor access is unavailable on this Linux session (common on Wayland without portal support); use capture_screen or capture_rect, or run diagnose_runtime for details"
+        "cursor access is unavailable on this Linux session (common on Wayland without portal support); use capture_screen or capture_rect, or run get_runtime_diagnostics for details"
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -57,7 +57,7 @@ mod tests {
     fn cursor_message_linux_includes_fallback_guidance() {
         let message = cursor_unavailable_message();
         assert!(message.contains("capture_screen"));
-        assert!(message.contains("diagnose_runtime"));
+        assert!(message.contains("get_runtime_diagnostics"));
     }
 
     #[cfg(not(target_os = "linux"))]

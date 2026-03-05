@@ -3,7 +3,7 @@ use xcap::{Monitor, Window, XCapError};
 
 use crate::{
     capture::{
-        backend::{CaptureBackend, MonitorInfo},
+        backend::{CaptureBackend, MonitorInfo, WindowInfo},
         region::{
             GlobalRect, MonitorBounds, Point, center_square_on_cursor, global_to_local_rect,
             rect_contains_point,
@@ -35,6 +35,9 @@ trait MonitorLike {
 }
 
 trait WindowLike {
+    fn id(&self) -> Result<u32, XCapError>;
+    fn app_name(&self) -> Result<String, XCapError>;
+    fn title(&self) -> Result<String, XCapError>;
     fn x(&self) -> Result<i32, XCapError>;
     fn y(&self) -> Result<i32, XCapError>;
     fn width(&self) -> Result<u32, XCapError>;
@@ -102,6 +105,18 @@ impl MonitorLike for Monitor {
 }
 
 impl WindowLike for Window {
+    fn id(&self) -> Result<u32, XCapError> {
+        Window::id(self)
+    }
+
+    fn app_name(&self) -> Result<String, XCapError> {
+        Window::app_name(self)
+    }
+
+    fn title(&self) -> Result<String, XCapError> {
+        Window::title(self)
+    }
+
     fn x(&self) -> Result<i32, XCapError> {
         Window::x(self)
     }
@@ -183,12 +198,44 @@ where
         monitor_infos_from_monitors(&monitors)
     }
 
+    fn list_windows(&self) -> Result<Vec<WindowInfo>, ServerError> {
+        let windows = self.source.all_windows().map_err(map_window_error)?;
+        window_infos_from_windows(&windows)
+    }
+
     fn capture_screen(&self, monitor_id: Option<u32>) -> Result<RgbaImage, ServerError> {
         let monitors = self.source.all_monitors().map_err(map_monitor_error)?;
         let monitor_selectors = monitor_selector_entries(&monitors)?;
         let index = select_monitor_index(&monitor_selectors, monitor_id)?;
 
         monitors[index].capture_image().map_err(map_monitor_error)
+    }
+
+    fn capture_window(&self, window_id: u32) -> Result<RgbaImage, ServerError> {
+        let windows = self.source.all_windows().map_err(map_window_error)?;
+        let window_selectors = window_selector_entries(&windows)?;
+        let index = select_window_index_by_id(&window_selectors, window_id)?;
+
+        windows[index].capture_image().map_err(map_window_error)
+    }
+
+    fn capture_monitor_region(
+        &self,
+        monitor_id: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<RgbaImage, ServerError> {
+        let monitors = self.source.all_monitors().map_err(map_monitor_error)?;
+        let monitor_selectors = monitor_selector_entries(&monitors)?;
+        let index = select_monitor_index_by_id(&monitor_selectors, monitor_id)?;
+        let bounds = monitor_bounds(&monitors[index])?;
+        validate_monitor_local_region(bounds, x, y, width, height)?;
+
+        monitors[index]
+            .capture_region(x, y, width, height)
+            .map_err(map_region_error)
     }
 
     fn capture_active_window(&self) -> Result<RgbaImage, ServerError> {
@@ -253,6 +300,12 @@ struct MonitorSelectorEntry {
     is_primary: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WindowSelectorEntry {
+    index: usize,
+    id: u32,
+}
+
 fn monitor_infos_from_monitors<M: MonitorLike>(
     monitors: &[M],
 ) -> Result<Vec<MonitorInfo>, ServerError> {
@@ -289,6 +342,40 @@ fn monitor_selector_entries<M: MonitorLike>(
         .collect()
 }
 
+fn window_infos_from_windows<W: WindowLike>(windows: &[W]) -> Result<Vec<WindowInfo>, ServerError> {
+    windows
+        .iter()
+        .map(|window| {
+            Ok(WindowInfo {
+                id: window.id().map_err(map_window_error)?,
+                title: window.title().map_err(map_window_error)?,
+                app: window.app_name().map_err(map_window_error)?,
+                x: window.x().map_err(map_window_error)?,
+                y: window.y().map_err(map_window_error)?,
+                width: window.width().map_err(map_window_error)?,
+                height: window.height().map_err(map_window_error)?,
+                is_focused: window.is_focused().map_err(map_window_error)?,
+                is_minimized: window.is_minimized().map_err(map_window_error)?,
+            })
+        })
+        .collect()
+}
+
+fn window_selector_entries<W: WindowLike>(
+    windows: &[W],
+) -> Result<Vec<WindowSelectorEntry>, ServerError> {
+    windows
+        .iter()
+        .enumerate()
+        .map(|(index, window)| {
+            Ok(WindowSelectorEntry {
+                index,
+                id: window.id().map_err(map_window_error)?,
+            })
+        })
+        .collect()
+}
+
 fn descriptors_from_windows<W: WindowLike>(
     windows: &[W],
 ) -> Result<Vec<WindowDescriptor>, ServerError> {
@@ -316,15 +403,7 @@ fn select_monitor_index(
     }
 
     if let Some(requested_id) = requested_id {
-        return monitors
-            .iter()
-            .find(|monitor| monitor.id == requested_id)
-            .map(|monitor| monitor.index)
-            .ok_or_else(|| {
-                ServerError::monitor_not_found(format!(
-                    "monitor with id {requested_id} could not be found"
-                ))
-            });
+        return select_monitor_index_by_id(monitors, requested_id);
     }
 
     monitors
@@ -332,6 +411,36 @@ fn select_monitor_index(
         .find(|monitor| monitor.is_primary)
         .map(|monitor| monitor.index)
         .ok_or_else(|| ServerError::monitor_not_found("primary monitor could not be found"))
+}
+
+fn select_monitor_index_by_id(
+    monitors: &[MonitorSelectorEntry],
+    requested_id: u32,
+) -> Result<usize, ServerError> {
+    monitors
+        .iter()
+        .find(|monitor| monitor.id == requested_id)
+        .map(|monitor| monitor.index)
+        .ok_or_else(|| {
+            ServerError::monitor_not_found(format!(
+                "monitor with id {requested_id} could not be found"
+            ))
+        })
+}
+
+fn select_window_index_by_id(
+    windows: &[WindowSelectorEntry],
+    requested_id: u32,
+) -> Result<usize, ServerError> {
+    windows
+        .iter()
+        .find(|window| window.id == requested_id)
+        .map(|window| window.index)
+        .ok_or_else(|| {
+            ServerError::window_not_found(format!(
+                "window with id {requested_id} could not be found"
+            ))
+        })
 }
 
 fn select_focused_window_index(descriptors: &[WindowDescriptor]) -> Option<usize> {
@@ -366,6 +475,35 @@ fn monitor_bounds<M: MonitorLike>(monitor: &M) -> Result<MonitorBounds, ServerEr
         width: monitor.width().map_err(map_monitor_error)?,
         height: monitor.height().map_err(map_monitor_error)?,
     })
+}
+
+fn validate_monitor_local_region(
+    bounds: MonitorBounds,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> Result<(), ServerError> {
+    if width == 0 || height == 0 {
+        return Err(ServerError::invalid_region(
+            "width and height must be greater than 0",
+        ));
+    }
+
+    let right = x
+        .checked_add(width)
+        .ok_or_else(|| ServerError::invalid_region("rectangle width overflows coordinate range"))?;
+    let bottom = y.checked_add(height).ok_or_else(|| {
+        ServerError::invalid_region("rectangle height overflows coordinate range")
+    })?;
+
+    if right > bounds.width || bottom > bounds.height {
+        return Err(ServerError::invalid_region(
+            "requested rectangle is outside monitor bounds",
+        ));
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -543,13 +681,16 @@ mod tests {
             Ok(RgbaImage::from_pixel(
                 width,
                 height,
-                image::Rgba([9, 9, 9, 255]),
+                image::Rgba([self.id as u8, 9, 9, 255]),
             ))
         }
     }
 
     #[derive(Debug, Clone)]
     struct FakeWindow {
+        id: u32,
+        title: String,
+        app_name: String,
         x: i32,
         y: i32,
         width: u32,
@@ -560,6 +701,18 @@ mod tests {
     }
 
     impl WindowLike for FakeWindow {
+        fn id(&self) -> Result<u32, XCapError> {
+            Ok(self.id)
+        }
+
+        fn app_name(&self) -> Result<String, XCapError> {
+            Ok(self.app_name.clone())
+        }
+
+        fn title(&self) -> Result<String, XCapError> {
+            Ok(self.title.clone())
+        }
+
         fn x(&self) -> Result<i32, XCapError> {
             Ok(self.x)
         }
@@ -667,6 +820,9 @@ mod tests {
             ],
             windows: vec![
                 FakeWindow {
+                    id: 11,
+                    title: "Primary Window".to_owned(),
+                    app_name: "TestApp".to_owned(),
                     x: 0,
                     y: 0,
                     width: 40,
@@ -676,6 +832,9 @@ mod tests {
                     image_error: None,
                 },
                 FakeWindow {
+                    id: 22,
+                    title: "Secondary Window".to_owned(),
+                    app_name: "OtherApp".to_owned(),
                     x: 50,
                     y: 50,
                     width: 20,
@@ -696,6 +855,17 @@ mod tests {
         assert_eq!(monitors.len(), 2);
         assert_eq!(monitors[0].name, "Primary");
         assert!(monitors[0].is_primary);
+    }
+
+    #[test]
+    fn capture_list_windows_maps_source_data() {
+        let backend = XcapBackend::with_source(fake_source());
+        let windows = backend.list_windows().expect("list windows");
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].id, 11);
+        assert_eq!(windows[0].title, "Primary Window");
+        assert_eq!(windows[0].app, "TestApp");
+        assert!(windows[0].is_focused);
     }
 
     #[test]
@@ -730,6 +900,52 @@ mod tests {
             .capture_screen(None)
             .expect_err("monitor capture image error should fail");
         assert_eq!(error.error_code(), "monitor_not_found");
+    }
+
+    #[test]
+    fn capture_window_uses_requested_window_id() {
+        let backend = XcapBackend::with_source(fake_source());
+        let image = backend.capture_window(22).expect("capture window 22");
+        assert_eq!(image.width(), 5);
+        assert_eq!(image.height(), 4);
+    }
+
+    #[test]
+    fn capture_window_reports_window_not_found_for_unknown_id() {
+        let backend = XcapBackend::with_source(fake_source());
+        let error = backend
+            .capture_window(999)
+            .expect_err("unknown window id should fail");
+        assert_eq!(error.error_code(), "window_not_found");
+    }
+
+    #[test]
+    fn capture_monitor_region_uses_requested_monitor_and_local_region() {
+        let backend = XcapBackend::with_source(fake_source());
+        let image = backend
+            .capture_monitor_region(2, 10, 10, 7, 6)
+            .expect("capture monitor region");
+        assert_eq!(image.width(), 7);
+        assert_eq!(image.height(), 6);
+        assert_eq!(image.get_pixel(0, 0).0[0], 2);
+    }
+
+    #[test]
+    fn capture_monitor_region_reports_monitor_not_found_for_unknown_id() {
+        let backend = XcapBackend::with_source(fake_source());
+        let error = backend
+            .capture_monitor_region(999, 10, 10, 7, 6)
+            .expect_err("unknown monitor id should fail");
+        assert_eq!(error.error_code(), "monitor_not_found");
+    }
+
+    #[test]
+    fn capture_monitor_region_rejects_out_of_bounds_local_region() {
+        let backend = XcapBackend::with_source(fake_source());
+        let error = backend
+            .capture_monitor_region(1, 95, 70, 10, 20)
+            .expect_err("out-of-bounds local region should fail");
+        assert_eq!(error.error_code(), "invalid_region");
     }
 
     #[test]
