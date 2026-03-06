@@ -17,7 +17,6 @@ jobs:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -37,6 +36,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ runner.os }}-${{ matrix.target }}
+          save-if: ${{ github.event_name != 'pull_request' }}
+          cache-on-failure: true
 
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
