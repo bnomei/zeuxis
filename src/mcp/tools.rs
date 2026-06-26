@@ -1170,44 +1170,45 @@ impl ZeuxisScreenshotServer {
                     }
                 };
 
-                let now = std::time::Instant::now();
-                if now > deadline {
-                    let _ = cleanup_worker_artifact_path(Path::new(&worker_result.artifact_path));
-                    Err(ServerError::storage_failed(
-                        timeout_message_for_worker.clone(),
-                    ))
-                } else {
-                    let remaining = deadline.saturating_duration_since(now);
-                    let storage = Arc::clone(&storage);
-                    let artifact_path = PathBuf::from(worker_result.artifact_path.clone());
-                    let output_options = CaptureOutputOptions {
-                        format: output_for_request.format.to_storage(),
-                        jpeg_quality: output_for_request.jpeg_quality,
-                    };
-                    let adopted = run_blocking_with_timeout(
-                        remaining,
-                        timeout_message_for_worker.clone(),
-                        "capture adopt worker task failed",
-                        move || storage.adopt_artifact(artifact_path, capture_mode, output_options),
-                    )
-                    .await;
+                // `run_worker_capture` already enforced the hard timeout on the
+                // worker's `child.wait()` (and terminates/reaps on overrun), so an
+                // `Ok` here means the capture completed within budget. The previous
+                // `now > deadline` check rejected such successes — and deleted their
+                // artifacts — whenever spawn/stdin/stdout-drain overhead pushed the
+                // wall clock past `deadline`, because that overhead is counted on top
+                // of the same `worker_timeout` budget already spent on `child.wait()`.
+                // Honor the successful capture (C009) and bound only the adoption
+                // step, which is a fast local filesystem operation; use `worker_timeout`
+                // as a generous guard against a hung filesystem without starving a
+                // near-limit success.
+                let storage = Arc::clone(&storage);
+                let artifact_path = PathBuf::from(worker_result.artifact_path.clone());
+                let output_options = CaptureOutputOptions {
+                    format: output_for_request.format.to_storage(),
+                    jpeg_quality: output_for_request.jpeg_quality,
+                };
+                let adopted = run_blocking_with_timeout(
+                    worker_timeout,
+                    timeout_message_for_worker.clone(),
+                    "capture adopt worker task failed",
+                    move || storage.adopt_artifact(artifact_path, capture_mode, output_options),
+                )
+                .await;
 
-                    match adopted {
-                        Ok(artifact) => Ok((
-                            artifact,
-                            worker_result.source_width,
-                            worker_result.source_height,
-                            worker_result.target,
-                            worker_result.input_units,
-                            worker_result.input_width,
-                            worker_result.input_height,
-                        )),
-                        Err(error) => {
-                            let _ = cleanup_worker_artifact_path(Path::new(
-                                &worker_result.artifact_path,
-                            ));
-                            Err(error)
-                        }
+                match adopted {
+                    Ok(artifact) => Ok((
+                        artifact,
+                        worker_result.source_width,
+                        worker_result.source_height,
+                        worker_result.target,
+                        worker_result.input_units,
+                        worker_result.input_width,
+                        worker_result.input_height,
+                    )),
+                    Err(error) => {
+                        let _ =
+                            cleanup_worker_artifact_path(Path::new(&worker_result.artifact_path));
+                        Err(error)
                     }
                 }
             }

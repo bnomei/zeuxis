@@ -1,5 +1,5 @@
 DEVANA-FINDING: v1
-Priority: P1 | Confidence: high | Security-sensitive: no | Status: open
+Priority: P1 | Confidence: high | Security-sensitive: no | Status: fixed
 Location: src/mcp/tools.rs:1078 | Slug: worker-timeout-budget-exhausted
 
 # Subprocess capture timeout budget is consumed by spawn/IPC overhead, rejecting near-limit successes
@@ -40,5 +40,9 @@ Slow captures (large monitors, busy systems, low timeout settings) fail despite 
 
 Anchor one end-to-end deadline at permit acquisition (or subtract measured spawn/IPC from worker wait budget) and reserve time for adoption; remove or relax the redundant post-worker deadline check that double-counts overhead.
 
+## Status Notes
+
+- 2026-06-26: fixed. Confirmed: `run_worker_capture` bounds only `child.wait()` to `worker_timeout` (`src/worker/parent.rs:54`), while `deadline = now + worker_timeout` is anchored just before the call (`src/mcp/tools.rs:1078`). Spawn + stdin write + stdout drain + parse add overhead ε on top of a near-`worker_timeout` `child.wait()`, so total elapsed exceeds `deadline`, and the post-worker `now > deadline` check rejected the (already successful) capture with `storage_failed` and deleted the artifact — violating C009. Adoption was also starved (`remaining ≈ 0`). Fix: removed the redundant post-worker `now > deadline` rejection. The hard timeout (C002/C003/C004) is still fully enforced inside `run_worker_capture`, which times out, terminates, and reaps an overrunning child and returns the timeout error before parsing — so a returned `Ok` already means success within budget. Adoption (a fast local FS step) is now bounded by `worker_timeout` instead of `deadline - now`, guarding against a hung filesystem without starving a near-limit success. `deadline` remains in use by the Inline path. Full lib (137) + tool_calls (34) suites pass. No new timing test added: a faithful repro needs a real worker subprocess finishing ~ε before the budget, which is inherently flaky.
+
 DEVANA-KEY: src/mcp/tools.rs:1078 | P1 | worker-timeout-budget-exhausted
-DEVANA-SUMMARY: P1 high src/mcp/tools.rs:1078 - Subprocess captures near the timeout limit fail storage_failed despite worker success because spawn/IPC overhead is not accounted for in the worker wait budget.
+DEVANA-SUMMARY: Status=fixed | P1 high src/mcp/tools.rs:1078 - Removed the redundant post-worker deadline check that double-counted spawn/IPC overhead and rejected successful near-limit captures; the hard timeout is still enforced inside run_worker_capture, and adoption is bounded by worker_timeout rather than starved.
