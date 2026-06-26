@@ -1,5 +1,5 @@
 DEVANA-FINDING: v1
-Priority: P2 | Confidence: medium | Security-sensitive: no | Status: open
+Priority: P2 | Confidence: medium | Security-sensitive: no | Status: fixed
 Location: src/storage/mod.rs:346 | Slug: session-cache-drain-orphans-files
 
 # Session artifact cache eviction drops entries without deleting files
@@ -40,5 +40,9 @@ Orphaned screenshot files leak session captures past explicit cleanup, undermini
 
 Delete files for entries removed by `drain`, or only evict cache entries after confirmed `remove_file` success; align cache eviction with `prune_artifacts` outcomes.
 
+## Status Notes
+
+- 2026-06-26: fixed. Confirmed: `finalize_artifact`'s `artifacts.drain(0..overflow)` removed session-cache metadata without deleting files. The directory prune (`prune_artifacts`) only scans the *current* artifact's directory, so a session-cache entry whose file is elsewhere (mixed inline/worker paths — now unified by the artifact-dir-ignored-subprocess fix — or a transient prune miss) could survive on disk yet drop out of the cache, beyond `clear_session_artifacts`' reach. Fix: iterate the drained entries and best-effort `fs::remove_file` each evicted file. Chose delete-on-drain over "only evict after confirmed delete" because the latter would let un-deletable entries grow the cache unbounded. Note: when the parent directory itself is undeletable (the report's read-only-dir example), neither prune nor this path can remove the file — that is an unfixable filesystem condition that `clear_session_artifacts` would also hit. Added regression test `storage_finalize_deletes_files_evicted_from_session_cache` (seeds a cross-directory session entry that prune cannot reach, then asserts the drain deletes it). Full lib suite (139) passes.
+
 DEVANA-KEY: src/storage/mod.rs:346 | P2 | session-cache-drain-orphans-files
-DEVANA-SUMMARY: P2 medium src/storage/mod.rs:346 - Session cache drain evicts artifact metadata without deleting files, so clear_session_artifacts can miss orphaned screenshots.
+DEVANA-SUMMARY: Status=fixed | P2 medium src/storage/mod.rs:346 - Session-cache drain now best-effort deletes each evicted artifact's file, so entries leaving the cache no longer orphan screenshots that clear_session_artifacts can't reach.

@@ -355,7 +355,16 @@ impl TempPngStorage {
             artifacts.push(artifact.clone());
             if artifacts.len() > self.retention_policy.max_artifacts {
                 let overflow = artifacts.len() - self.retention_policy.max_artifacts;
-                artifacts.drain(0..overflow);
+                for evicted in artifacts.drain(0..overflow) {
+                    // The directory prune above normally already removed these
+                    // files, but it only scans the current artifact's directory.
+                    // Delete best-effort here too so an entry that drops out of
+                    // the session cache never leaves an orphaned file on disk that
+                    // clear_session_artifacts can no longer reach.
+                    if evicted.path.exists() {
+                        let _ = fs::remove_file(&evicted.path);
+                    }
+                }
             }
         }
         if let Ok(mut latest) = self.latest_artifact_cache.lock() {
@@ -667,6 +676,61 @@ mod tests {
             .permissions();
         restore.set_mode(0o700);
         fs::set_permissions(&artifact_dir, restore).expect("restore writable perms");
+    }
+
+    #[test]
+    fn storage_finalize_deletes_files_evicted_from_session_cache() {
+        let dir = tempdir().expect("tempdir");
+        // Pre-seed a session-cache entry whose file lives in a *different*
+        // directory, so the per-directory prune for the next capture never
+        // targets it. This isolates the cache-drain deletion path.
+        let other = tempdir().expect("other tempdir");
+        let stale_path = write_artifact(other.path(), "stale", 8);
+
+        let storage = TempPngStorage::with_settings(
+            1,
+            DEFAULT_MAX_ARTIFACT_BYTES,
+            Some(dir.path().to_path_buf()),
+            None,
+        );
+        storage
+            .session_artifacts
+            .lock()
+            .expect("lock")
+            .push(StoredArtifact {
+                artifact_id: "zeuxis-capture_screen-stale.png".to_owned(),
+                capture_mode: "capture_screen".to_owned(),
+                uri: Url::from_file_path(&stale_path)
+                    .expect("file uri")
+                    .to_string(),
+                path: stale_path.clone(),
+                output_format: "png".to_owned(),
+                mime_type: "image/png".to_owned(),
+                artifact_sha256: "00".repeat(32),
+                artifact_hmac_sha256: None,
+                width: 4,
+                height: 3,
+                captured_at_utc: "2026-01-01T00:00:00Z".to_owned(),
+            });
+
+        // Finalize a fresh capture in the storage dir; with max_artifacts = 1 this
+        // overflows the session cache and drains the stale entry, which must take
+        // its on-disk file with it rather than orphan it.
+        let new_path = write_artifact(dir.path(), "new", 8);
+        storage
+            .finalize_artifact(
+                new_path,
+                "capture_screen",
+                CaptureOutputOptions::default(),
+                4,
+                3,
+            )
+            .expect("finalize");
+
+        assert!(
+            !stale_path.exists(),
+            "evicted session-cache file must be deleted, not orphaned"
+        );
     }
 
     #[test]
