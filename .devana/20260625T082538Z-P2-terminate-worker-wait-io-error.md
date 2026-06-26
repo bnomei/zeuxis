@@ -1,5 +1,5 @@
 DEVANA-FINDING: v1
-Priority: P2 | Confidence: medium | Security-sensitive: no | Status: open
+Priority: P2 | Confidence: medium | Security-sensitive: no | Status: fixed
 Location: src/worker/parent.rs:161 | Slug: terminate-worker-wait-io-error
 
 # terminate_worker treats child.wait() I/O error as successful termination
@@ -40,5 +40,9 @@ Timed-out workers may not be explicitly reaped, leaving zombie or lingering capt
 
 Match on inner `Result`: treat `Ok(Err(_))` like failure and escalate to hard-kill; only return `Ok(())` when `Ok(Ok(_))` confirms exit.
 
+## Status Notes
+
+- 2026-06-26: fixed. Confirmed: `tokio::time::timeout(kill_grace, child.wait()).await` is `Result<Result<ExitStatus, io::Error>, Elapsed>`, and `.is_ok()` was true for both `Ok(Ok(status))` (clean exit) and `Ok(Err(io_error))` (wait failed) — so a `child.wait()` I/O error during the grace window returned `Ok(())` and skipped the hard-kill/reap path (violating C003/C003a). Fix: replaced `.is_ok()` with an explicit match — only `Ok(Ok(_))` (confirmed exit) returns early; `Ok(Err(_))` (wait I/O error) now logs and falls through to `child.kill()` + post-kill reap, same as the elapsed-timeout (`Err(_)`) branch. No new test: deterministically forcing `child.wait()` to return an I/O error against a real `tokio::process::Child` is impractical; existing terminate tests cover the clean-exit and timeout→hard-kill paths and still pass.
+
 DEVANA-KEY: src/worker/parent.rs:161 | P2 | terminate-worker-wait-io-error
-DEVANA-SUMMARY: P2 medium src/worker/parent.rs:161 - terminate_worker returns success when child.wait() hits an I/O error, skipping the hard-kill path.
+DEVANA-SUMMARY: Status=fixed | P2 medium src/worker/parent.rs:161 - terminate_worker now matches the inner Result; a child.wait() I/O error during the grace window escalates to hard-kill/reap instead of being treated as a successful termination.

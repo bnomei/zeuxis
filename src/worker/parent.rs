@@ -158,8 +158,19 @@ async fn terminate_worker(
         }
     }
 
-    if tokio::time::timeout(kill_grace, child.wait()).await.is_ok() {
-        return Ok(());
+    match tokio::time::timeout(kill_grace, child.wait()).await {
+        // Only a confirmed clean exit lets us skip the hard kill.
+        Ok(Ok(_status)) => return Ok(()),
+        // `child.wait()` itself errored: we cannot confirm the child exited, so
+        // escalate to a hard kill rather than treat the I/O error as success.
+        Ok(Err(err)) => {
+            tracing::warn!(
+                error = %err,
+                "capture worker wait failed during grace period; escalating to hard kill"
+            );
+        }
+        // Grace period elapsed; the child is still running.
+        Err(_) => {}
     }
 
     child.kill().await.map_err(|err| {
