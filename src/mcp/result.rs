@@ -1,3 +1,9 @@
+//! Builders and payload schemas for MCP `CallToolResult` values.
+//!
+//! Each tool returns a short text summary plus structured content. Capture
+//! results also include a `file://` resource link so MCP clients can inspect the
+//! local artifact without any remote upload step.
+
 use std::path::Path;
 
 use rmcp::model::{CallToolResult, Content, RawResource};
@@ -10,6 +16,7 @@ use crate::{
     storage::StoredArtifact,
 };
 
+/// Output settings actually applied to a capture request.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct AppliedSettingsPayload {
     pub output_mode: String,
@@ -19,12 +26,14 @@ pub struct AppliedSettingsPayload {
     pub delay_seconds_applied: Option<f64>,
 }
 
+/// Ratio between requested logical input dimensions and captured source pixels.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct SourceScaleFactorPayload {
     pub x: f64,
     pub y: f64,
 }
 
+/// Rectangle target metadata returned in capture result payloads.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CaptureRectPayload {
     pub x: i32,
@@ -34,6 +43,7 @@ pub struct CaptureRectPayload {
     pub coordinate_space: String,
 }
 
+/// Optional monitor, window, or rectangle identity for the captured target.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct CaptureTargetPayload {
     pub monitor_id: Option<u32>,
@@ -41,6 +51,7 @@ pub struct CaptureTargetPayload {
     pub rect: Option<CaptureRectPayload>,
 }
 
+/// Context needed to interpret a capture artifact after it has been stored.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct CaptureContextPayload {
     pub applied_settings: AppliedSettingsPayload,
@@ -53,6 +64,11 @@ pub struct CaptureContextPayload {
     pub target: CaptureTargetPayload,
 }
 
+/// Structured content for successful capture-like tool responses.
+///
+/// `capture_mode` names the tool that returned the response; `artifact_capture_mode`
+/// names the capture that produced the underlying artifact, which differs for
+/// `get_latest_capture`.
 #[derive(Debug, Serialize)]
 pub struct CaptureSuccessPayload {
     pub path: String,
@@ -77,6 +93,7 @@ pub struct CaptureSuccessPayload {
     pub target: CaptureTargetPayload,
 }
 
+/// Structured content for monitor discovery.
 #[derive(Debug, Serialize)]
 pub struct MonitorListPayload {
     pub monitor_count: usize,
@@ -84,6 +101,7 @@ pub struct MonitorListPayload {
     pub listed_at_utc: String,
 }
 
+/// Structured content for window discovery and snapshot-scoped capture IDs.
 #[derive(Debug, Serialize)]
 pub struct WindowListPayload {
     pub id_scope: String,
@@ -93,6 +111,7 @@ pub struct WindowListPayload {
     pub windows: Vec<WindowInfo>,
 }
 
+/// Structured content for session artifact listing.
 #[derive(Debug, Serialize)]
 pub struct SessionArtifactsPayload {
     pub artifact_count: usize,
@@ -100,6 +119,7 @@ pub struct SessionArtifactsPayload {
     pub artifacts: Vec<SessionArtifactPayload>,
 }
 
+/// Stored artifact metadata shown by `list_session_artifacts`.
 #[derive(Debug, Serialize)]
 pub struct SessionArtifactPayload {
     pub artifact_id: String,
@@ -114,12 +134,14 @@ pub struct SessionArtifactPayload {
     pub is_latest: bool,
 }
 
+/// Current cursor position reported by runtime diagnostics.
 #[derive(Debug, Serialize)]
 pub struct CursorPositionPayload {
     pub x: i32,
     pub y: i32,
 }
 
+/// Readiness report for permissions, monitor discovery, and cursor access.
 #[derive(Debug, Serialize)]
 pub struct RuntimeDiagnosticsPayload {
     pub os: String,
@@ -143,12 +165,14 @@ pub struct RuntimeDiagnosticsPayload {
     pub diagnosed_at_utc: String,
 }
 
+/// Result payload for deleting artifacts created in the current server session.
 #[derive(Debug, Serialize)]
 pub struct ClearSessionArtifactsPayload {
     pub deleted_artifact_count: usize,
     pub cleared_at_utc: String,
 }
 
+/// Builds the structured MCP result and resource link for a stored capture artifact.
 pub fn success_result(
     capture_mode: &str,
     artifact: &StoredArtifact,
@@ -193,6 +217,7 @@ pub fn success_result(
     tool_result
 }
 
+/// Builds the structured MCP result for monitor discovery.
 pub fn monitors_result(monitors: Vec<MonitorInfo>) -> CallToolResult {
     let payload = MonitorListPayload {
         monitor_count: monitors.len(),
@@ -209,6 +234,7 @@ pub fn monitors_result(monitors: Vec<MonitorInfo>) -> CallToolResult {
     tool_result
 }
 
+/// Builds the structured MCP result for a window snapshot.
 pub fn windows_result(
     windows: Vec<WindowInfo>,
     snapshot_id: String,
@@ -232,6 +258,7 @@ pub fn windows_result(
     tool_result
 }
 
+/// Builds the structured MCP result for session artifact listing.
 pub fn list_session_artifacts_result(
     artifacts: Vec<StoredArtifact>,
     latest_artifact_id: Option<String>,
@@ -268,6 +295,7 @@ pub fn list_session_artifacts_result(
     tool_result
 }
 
+/// Builds the structured MCP result for runtime diagnostics.
 pub fn diagnostics_result(payload: RuntimeDiagnosticsPayload) -> CallToolResult {
     let mut tool_result = CallToolResult::success(vec![Content::text(format!(
         "Runtime diagnostics: permission_ok={} monitors_ok={} cursor_ok={}",
@@ -278,6 +306,7 @@ pub fn diagnostics_result(payload: RuntimeDiagnosticsPayload) -> CallToolResult 
     tool_result
 }
 
+/// Builds the structured MCP result for clearing session artifacts.
 pub fn clear_session_artifacts_result(deleted_artifact_count: usize) -> CallToolResult {
     let payload = ClearSessionArtifactsPayload {
         deleted_artifact_count,
@@ -292,6 +321,7 @@ pub fn clear_session_artifacts_result(deleted_artifact_count: usize) -> CallTool
     tool_result
 }
 
+/// Builds an MCP tool error while preserving Zeuxis error code and retryability.
 pub fn error_result(error: &ServerError) -> CallToolResult {
     let mut tool_result = CallToolResult::error(vec![Content::text(format!(
         "{}: {}",

@@ -1,3 +1,9 @@
+//! Zeuxis binary entrypoint: MCP stdio server and hidden capture worker mode.
+//!
+//! Default invocation serves MCP over stdin/stdout. The hidden `__worker`
+//! subcommand runs one-shot subprocess capture for production servers; logs go
+//! to stderr so stdout stays protocol-clean.
+
 use std::{error::Error, path::PathBuf};
 
 use clap::{Parser, Subcommand};

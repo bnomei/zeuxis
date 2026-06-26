@@ -1,5 +1,12 @@
+//! Coordinate types and overflow-safe region math for desktop captures.
+//!
+//! Zeuxis accepts logical desktop points from clients, translates them to
+//! monitor-local rectangles for capture backends, and treats rectangles as
+//! half-open bounds: left/top inclusive, right/bottom exclusive.
+
 use crate::mcp::errors::ServerError;
 
+/// Point in global logical desktop coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Point {
     pub x: i32,
@@ -7,11 +14,16 @@ pub struct Point {
 }
 
 impl Point {
+    /// Constructs a global desktop point from logical x/y coordinates.
     pub const fn new(x: i32, y: i32) -> Self {
         Self { x, y }
     }
 }
 
+/// Rectangle in global logical desktop coordinates.
+///
+/// `x` and `y` may be negative on multi-monitor desktops whose origin is not the
+/// top-left of every display.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GlobalRect {
     pub x: i32,
@@ -20,6 +32,10 @@ pub struct GlobalRect {
     pub height: u32,
 }
 
+/// Rectangle in monitor-local logical coordinates.
+///
+/// Local coordinates are unsigned because they have already been validated
+/// against a specific monitor's origin and bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LocalRect {
     pub x: u32,
@@ -28,6 +44,7 @@ pub struct LocalRect {
     pub height: u32,
 }
 
+/// Monitor bounds in the global logical desktop coordinate space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MonitorBounds {
     pub x: i32,
@@ -36,6 +53,9 @@ pub struct MonitorBounds {
     pub height: u32,
 }
 
+/// Builds a square global rectangle centered on the cursor point.
+///
+/// Returns `invalid_region` for zero size or coordinate overflow.
 pub fn center_square_on_cursor(cursor: Point, size: u32) -> Result<GlobalRect, ServerError> {
     if size == 0 {
         return Err(ServerError::invalid_region("size must be greater than 0"));
@@ -58,6 +78,10 @@ pub fn center_square_on_cursor(cursor: Point, size: u32) -> Result<GlobalRect, S
     })
 }
 
+/// Converts a global rectangle into monitor-local coordinates.
+///
+/// The full rectangle must fit inside the supplied monitor bounds; crossing a
+/// monitor edge is rejected rather than clipped.
 pub fn global_to_local_rect(
     global: GlobalRect,
     monitor: MonitorBounds,
@@ -111,6 +135,7 @@ pub fn global_to_local_rect(
     })
 }
 
+/// Tests whether a point lies inside a half-open rectangle.
 pub fn rect_contains_point(x: i32, y: i32, width: u32, height: u32, point: Point) -> bool {
     if width == 0 || height == 0 {
         return false;

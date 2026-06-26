@@ -1,3 +1,8 @@
+//! Parent-side supervisor for hidden capture worker processes.
+//!
+//! The parent owns the worker timeout, stdout byte budget, request/response ID
+//! validation, and graceful-then-hard termination before storage adoption.
+
 use std::{path::Path, time::Duration};
 
 use tokio::{
@@ -11,6 +16,10 @@ use super::contract::{WorkerRequest, WorkerSuccessPayload, parse_response_json};
 
 const HARD_KILL_WAIT_FALLBACK: Duration = Duration::from_millis(2_000);
 
+/// Runs one capture request in a subprocess worker and returns its success payload.
+///
+/// A valid response with the expected `request_id` is authoritative; process
+/// exit status is only diagnostic after the protocol payload has been accepted.
 pub async fn run_worker_capture(
     executable: &Path,
     request: &WorkerRequest,
@@ -51,6 +60,8 @@ pub async fn run_worker_capture(
     });
     let read_task = tokio::spawn(read_stdout_limited(stdout, max_stdout_bytes));
 
+    // Concurrent pipe tasks avoid deadlock when the child waits for stdin EOF
+    // while the parent is also waiting for the child to exit.
     let timed_wait = tokio::time::timeout(timeout, child.wait()).await;
     let status = match timed_wait {
         Ok(Ok(status)) => status,
@@ -93,15 +104,8 @@ pub async fn run_worker_capture(
         )));
     }
 
-    // A clean worker encodes every outcome — success and capture errors alike —
-    // as a valid response and exits 0. Reaching this point means we already have
-    // a valid, id-matched response, so its structured outcome is authoritative
-    // even if the process then exited non-zero (e.g. a post-serialize flush/write
-    // failure after stdout was fully written). The exit status only decides the
-    // outcome when no usable response exists, which is already handled by the
-    // parse-failure path above. Surface the anomaly in logs rather than clobbering
-    // a real (possibly non-retryable) error or a successful capture with a generic
-    // retryable storage_failed.
+    // A valid id-matched response is authoritative even when the process exits
+    // non-zero afterward (e.g. post-serialize flush failure after stdout was written).
     if !status.success() {
         tracing::warn!(
             %status,
@@ -171,20 +175,17 @@ async fn terminate_worker(
     }
 
     match tokio::time::timeout(kill_grace, child.wait()).await {
-        // Only a confirmed clean exit lets us skip the hard kill.
         Ok(Ok(_status)) => return Ok(()),
-        // `child.wait()` itself errored: we cannot confirm the child exited, so
-        // escalate to a hard kill rather than treat the I/O error as success.
         Ok(Err(err)) => {
             tracing::warn!(
                 error = %err,
                 "capture worker wait failed during grace period; escalating to hard kill"
             );
         }
-        // Grace period elapsed; the child is still running.
         Err(_) => {}
     }
 
+    // Grace period ended or wait errored without confirming exit; escalate to hard kill.
     child.kill().await.map_err(|err| {
         ServerError::storage_failed(format!("failed to hard-kill capture worker: {err}"))
     })?;
@@ -252,17 +253,11 @@ mod tests {
         );
         let response_json = serde_json::to_string(&response).expect("serialize response");
 
-        // A worker that emits a complete, valid error response and *then* exits
-        // non-zero — simulating a post-serialize flush/abort after stdout was
-        // already fully written.
-        let dir = std::env::temp_dir().join(format!(
-            "zeuxis-worker-exit-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("zeuxis-worker-exit-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create dir");
         let script_path = dir.join("worker.sh");
-        let script =
-            format!("#!/bin/sh\ncat > /dev/null\nprintf '%s' '{response_json}'\nexit 1\n");
+        let script = format!("#!/bin/sh\ncat > /dev/null\nprintf '%s' '{response_json}'\nexit 1\n");
         std::fs::write(&script_path, script).expect("write script");
         let mut perms = std::fs::metadata(&script_path)
             .expect("metadata")
@@ -294,8 +289,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         let error = result.expect_err("an ok=false response must surface as an error");
-        // The worker's structured error wins over the non-zero exit status; it is
-        // NOT clobbered into a generic retryable storage_failed.
         assert_eq!(error.error_code(), "window_not_found");
     }
 

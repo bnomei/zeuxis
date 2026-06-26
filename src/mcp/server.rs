@@ -1,3 +1,9 @@
+//! Server composition, component injection, and rmcp stdio serving.
+//!
+//! Production construction runs capture work in a subprocess worker, while
+//! component constructors keep capture inline for tests and embedders that own
+//! their backend, storage, and permission boundaries.
+
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -26,10 +32,13 @@ use crate::{
     storage::{PngStorage, TempPngStorage},
 };
 
+/// Side-effect boundary for successful-capture feedback.
 pub trait CaptureFeedbackEmitter: Send + Sync {
+    /// Emits best-effort feedback after a successful capture.
     fn emit_capture(&self);
 }
 
+/// Feedback emitter that writes an ASCII bell to stderr.
 #[derive(Debug, Default)]
 pub struct TerminalBellFeedbackEmitter;
 
@@ -39,12 +48,14 @@ impl CaptureFeedbackEmitter for TerminalBellFeedbackEmitter {
     }
 }
 
+/// Feedback emitter that tries a platform shutter sound before falling back to bell.
 #[derive(Debug, Clone, Default)]
 pub struct PlatformSoundFeedbackEmitter {
     capture_sound_file: Option<PathBuf>,
 }
 
 impl PlatformSoundFeedbackEmitter {
+    /// Creates a sound emitter with an optional operator-supplied sound file.
     pub const fn new(capture_sound_file: Option<PathBuf>) -> Self {
         Self { capture_sound_file }
     }
@@ -129,6 +140,7 @@ fn spawn_feedback_sound_process(command: &str, args: &[&str]) -> bool {
     }
 }
 
+/// Latest `list_windows` snapshot accepted by `capture_window`.
 #[derive(Debug, Clone)]
 pub(crate) struct WindowSnapshotState {
     pub snapshot_id: String,
@@ -137,22 +149,24 @@ pub(crate) struct WindowSnapshotState {
     pub windows: Vec<WindowInfo>,
 }
 
+/// Execution path for blocking capture work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CaptureExecutionMode {
+    /// Run capture in `spawn_blocking` inside the MCP server process.
     Inline,
+    /// Run capture in the hidden `__worker` subprocess protocol.
     SubprocessWorker,
 }
 
-/// The most recent successful capture's artifact paired with the context that
-/// describes it. Stored as a single unit under one lock so `get_latest_capture`
-/// can never combine one capture's artifact with another capture's geometry/scale
-/// metadata when captures run concurrently.
+/// Latest successful capture's artifact and context, stored under one lock so
+/// concurrent `get_latest_capture` calls cannot pair mismatched metadata.
 #[derive(Clone)]
 pub(crate) struct LatestCapture {
     pub(crate) artifact: crate::storage::StoredArtifact,
     pub(crate) context: crate::mcp::result::CaptureContextPayload,
 }
 
+/// MCP screenshot server with injected capture, cursor, permission, and storage boundaries.
 #[derive(Clone)]
 pub struct ZeuxisScreenshotServer {
     pub(crate) backend: Arc<dyn CaptureBackend>,
@@ -184,10 +198,15 @@ struct ServerSettings {
 }
 
 impl ZeuxisScreenshotServer {
+    /// Creates a production server from process environment runtime config.
     pub fn new() -> Self {
         Self::with_runtime_config(RuntimeConfig::from_env())
     }
 
+    /// Creates a production server from explicit runtime config.
+    ///
+    /// Capture work runs in subprocess worker mode, and storage retention/HMAC
+    /// settings are copied from the provided config.
     pub fn with_runtime_config(config: RuntimeConfig) -> Self {
         let worker_executable = std::env::current_exe().ok();
         Self::with_components_and_settings(
@@ -214,6 +233,7 @@ impl ZeuxisScreenshotServer {
         )
     }
 
+    /// Creates a server from injected components using inline capture execution.
     pub fn with_components(
         backend: Arc<dyn CaptureBackend>,
         cursor_provider: Arc<dyn CursorProvider>,
@@ -240,6 +260,7 @@ impl ZeuxisScreenshotServer {
         )
     }
 
+    /// Creates an inline server from injected components with explicit parallelism.
     pub fn with_components_and_parallelism(
         backend: Arc<dyn CaptureBackend>,
         cursor_provider: Arc<dyn CursorProvider>,
@@ -261,6 +282,7 @@ impl ZeuxisScreenshotServer {
         )
     }
 
+    /// Creates an inline server from injected components and feedback emitter.
     pub fn with_components_and_feedback(
         backend: Arc<dyn CaptureBackend>,
         cursor_provider: Arc<dyn CursorProvider>,
@@ -281,6 +303,7 @@ impl ZeuxisScreenshotServer {
         )
     }
 
+    /// Creates an inline server with explicit capture concurrency and timeout limits.
     pub fn with_components_and_limits(
         backend: Arc<dyn CaptureBackend>,
         cursor_provider: Arc<dyn CursorProvider>,
@@ -340,6 +363,7 @@ impl ZeuxisScreenshotServer {
         }
     }
 
+    /// Serves MCP over stdio until the client disconnects.
     pub async fn serve_stdio(self) -> Result<(), rmcp::RmcpError> {
         let service = self.serve(rmcp::transport::stdio()).await?;
         service.waiting().await?;

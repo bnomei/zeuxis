@@ -1,7 +1,14 @@
+//! Runtime configuration from CLI defaults, environment variables, and clamps.
+//!
+//! Invalid numeric environment values fall back to defaults with warnings so a
+//! long-lived MCP server keeps a safe operating envelope instead of failing
+//! startup on a single bad knob.
+
 use std::path::PathBuf;
 
 use tracing::warn;
 
+// `ZEUXIS_*` environment variable names shared by CLI flags and `from_env`.
 pub const ENV_MAX_CONCURRENT_CAPTURES: &str = "ZEUXIS_MAX_CONCURRENT_CAPTURES";
 pub const ENV_MAX_ARTIFACTS: &str = "ZEUXIS_MAX_ARTIFACTS";
 pub const ENV_MAX_ARTIFACT_BYTES: &str = "ZEUXIS_MAX_ARTIFACT_BYTES";
@@ -12,6 +19,7 @@ pub const ENV_CAPTURE_SOUND_FILE: &str = "ZEUXIS_CAPTURE_SOUND_FILE";
 pub const ENV_WORKER_KILL_GRACE_MS: &str = "ZEUXIS_WORKER_KILL_GRACE_MS";
 pub const ENV_MAX_WORKER_STDOUT_BYTES: &str = "ZEUXIS_MAX_WORKER_STDOUT_BYTES";
 
+// Supported ranges for capture concurrency, artifact retention, and worker limits.
 pub const DEFAULT_MAX_CONCURRENT_CAPTURES: usize = 2;
 pub const MIN_MAX_CONCURRENT_CAPTURES: usize = 1;
 pub const MAX_MAX_CONCURRENT_CAPTURES: usize = 16;
@@ -36,16 +44,31 @@ pub const DEFAULT_MAX_WORKER_STDOUT_BYTES: u64 = 64 * 1024;
 pub const MIN_MAX_WORKER_STDOUT_BYTES: u64 = 1024;
 pub const MAX_MAX_WORKER_STDOUT_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Operational limits and side-effect settings for a Zeuxis server instance.
+///
+/// CLI parsing and `RuntimeConfig::from_env` apply the same ranges for capture
+/// concurrency, artifact retention, worker timeouts, worker stdout limits, and
+/// optional capture feedback sound paths. Unset `artifact_dir` selects an
+/// auto-managed session directory under the system temp path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeConfig {
+    /// Concurrent capture permits enforced by the MCP server semaphore.
     pub max_concurrent_captures: usize,
+    /// Maximum session artifacts retained in memory before eviction deletes files.
     pub max_artifacts: usize,
+    /// Total on-disk bytes budget for managed artifacts in the artifact directory.
     pub max_artifact_bytes: u64,
+    /// Directory for encoded screenshots; `None` uses an auto-managed temp session dir.
     pub artifact_dir: Option<PathBuf>,
+    /// Optional HMAC key for `artifact_hmac_sha256` integrity metadata.
     pub artifact_hmac_key: Option<Vec<u8>>,
+    /// Timeout for blocking capture, listing, and storage work in milliseconds.
     pub blocking_task_timeout_ms: u64,
+    /// Optional operator sound file played after successful captures.
     pub capture_sound_file: Option<PathBuf>,
+    /// Grace period after SIGTERM before the parent hard-kills a worker subprocess.
     pub worker_kill_grace_ms: u64,
+    /// Maximum worker stdout bytes accepted for one JSON response line.
     pub max_worker_stdout_bytes: u64,
 }
 
@@ -66,6 +89,7 @@ impl Default for RuntimeConfig {
 }
 
 impl RuntimeConfig {
+    /// Reads `ZEUXIS_*` environment variables with default fallback on invalid input.
     pub fn from_env() -> Self {
         Self::from_lookup(|name| std::env::var(name).ok())
     }
@@ -138,6 +162,8 @@ fn parse_lookup_non_empty_bytes<F>(lookup: &F, name: &str) -> Option<Vec<u8>>
 where
     F: Fn(&str) -> Option<String>,
 {
+    // HMAC keys are byte secrets: preserve the exact value, including
+    // whitespace, and reject only an empty string.
     lookup(name)
         .map(|value| value.into_bytes())
         .filter(|value| !value.is_empty())

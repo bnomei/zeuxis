@@ -1,13 +1,24 @@
+//! Platform permission gates for screen capture.
+//!
+//! macOS requires a Screen Recording preflight/request cycle, Linux currently
+//! relies on backend behavior, and other platforms fail before capture work is
+//! attempted.
+
 use crate::mcp::errors::ServerError;
 
+/// Boundary that decides whether capture work may proceed.
 pub trait PermissionGate: Send + Sync {
+    /// Returns `permission_denied` or `capture_unsupported_on_platform` when
+    /// the current session cannot capture screens yet.
     fn ensure_capture_allowed(&self) -> Result<(), ServerError>;
 }
 
+/// Default permission gate for the current operating system.
 #[derive(Debug, Clone, Default)]
 pub struct PlatformPermissionGate;
 
 impl PlatformPermissionGate {
+    /// Creates a permission gate using platform APIs when available.
     pub const fn new() -> Self {
         Self
     }
@@ -46,6 +57,8 @@ fn evaluate_macos_permission(api: &dyn MacScreenCaptureAccess) -> Result<(), Ser
         return Ok(());
     }
 
+    // Requesting can show the system prompt, but the current capture call still
+    // has to fail; clients retry after the user grants Screen Recording access.
     let _ = api.request();
 
     Err(ServerError::permission_denied(
@@ -60,10 +73,14 @@ struct CoreGraphicsScreenCaptureAccess;
 #[cfg(target_os = "macos")]
 impl MacScreenCaptureAccess for CoreGraphicsScreenCaptureAccess {
     fn preflight(&self) -> bool {
+        // SAFETY: CoreGraphics exposes this permission query as a no-argument C
+        // function returning a bool and does not retain Rust-managed data.
         unsafe { CGPreflightScreenCaptureAccess() }
     }
 
     fn request(&self) -> bool {
+        // SAFETY: CoreGraphics exposes this permission request as a no-argument C
+        // function returning a bool and does not retain Rust-managed data.
         unsafe { CGRequestScreenCaptureAccess() }
     }
 }

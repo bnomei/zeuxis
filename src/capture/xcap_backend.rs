@@ -1,3 +1,9 @@
+//! Production `xcap` adapter for monitor, window, and region capture.
+//!
+//! This module keeps platform-specific `xcap` behavior behind `CaptureBackend`,
+//! including monitor/window selection and best-effort normalization of backend
+//! errors into stable MCP error codes.
+
 use image::RgbaImage;
 use xcap::{Monitor, Window, XCapError};
 
@@ -12,9 +18,12 @@ use crate::{
     mcp::errors::ServerError,
 };
 
+/// Production xcap source backed by the current graphical session.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemXcapSource;
 
+// Small traits make the xcap adapter fakeable in tests without exposing xcap
+// concrete types throughout the rest of the crate.
 trait MonitorLike {
     fn id(&self) -> Result<u32, XCapError>;
     fn name(&self) -> Result<String, XCapError>;
@@ -163,12 +172,17 @@ impl XcapSource for SystemXcapSource {
     }
 }
 
+/// `CaptureBackend` implementation backed by the `xcap` crate.
+///
+/// The default backend selects the primary monitor when no monitor ID is
+/// supplied and uses backend window order for cursor-window selection.
 #[derive(Debug, Clone)]
 pub struct XcapBackend<S = SystemXcapSource> {
     source: S,
 }
 
 impl XcapBackend<SystemXcapSource> {
+    /// Creates a backend connected to the system xcap source.
     pub const fn new() -> Self {
         Self {
             source: SystemXcapSource,
@@ -270,6 +284,8 @@ where
     }
 
     fn capture_rect(&self, rect: GlobalRect) -> Result<RgbaImage, ServerError> {
+        // xcap resolves a monitor from one point, so require the whole global
+        // rectangle to fit the monitor that contains the rectangle origin.
         let monitor = self
             .source
             .monitor_from_point(rect.x, rect.y)
@@ -452,6 +468,8 @@ fn select_focused_window_index(descriptors: &[WindowDescriptor]) -> Option<usize
 }
 
 fn select_window_at_cursor_index(descriptors: &[WindowDescriptor], cursor: Point) -> Option<usize> {
+    // Preserve backend order, which xcap treats as the topmost-to-bottom window
+    // order used by cursor-window capture.
     descriptors
         .iter()
         .enumerate()
@@ -542,6 +560,8 @@ fn map_xcap_error(error: XCapError, context: XcapErrorContext) -> ServerError {
 
 fn map_xcap_message(message: String, context: XcapErrorContext) -> ServerError {
     let lowered = message.to_lowercase();
+    // xcap reports many platform failures as strings; route known phrases to
+    // stable MCP error codes before falling back to the operation context.
     #[cfg(target_os = "linux")]
     if let Some(mapped) = map_linux_xcap_message(&message, &lowered) {
         return mapped;
