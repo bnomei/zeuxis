@@ -1313,7 +1313,14 @@ impl ZeuxisScreenshotServer {
     }
 
     fn create_worker_artifact_path(&self, capture_mode: &str, suffix: &str) -> PathBuf {
-        let base = std::env::temp_dir().join("zeuxis-worker-artifacts");
+        // Stage worker artifacts in the storage's configured artifact directory
+        // (honoring `--artifact-dir`) rather than a hardcoded temp subdirectory.
+        // `adopt_artifact` keeps the file in place, and retention/session caches
+        // key off the artifact's directory, so this is what makes worker-mode
+        // captures land where the operator configured and be tracked by
+        // list/clear_session_artifacts. The `zeuxis-` filename prefix keeps the
+        // file managed by retention while leaving unrelated files untouched.
+        let base = self.storage.artifact_dir();
         let _ = std::fs::create_dir_all(&base);
         let artifact_id = next_worker_artifact_id();
         base.join(format!("zeuxis-{capture_mode}-{artifact_id}{suffix}"))
@@ -2441,6 +2448,47 @@ mod tests {
         assert_eq!(output.target.window_id, Some(200));
         assert_eq!(output.input_width, Some(50));
         assert_eq!(output.input_height, Some(20));
+    }
+
+    #[test]
+    fn mcp_tools_worker_artifact_path_uses_configured_artifact_dir() {
+        use std::sync::Arc;
+
+        struct AllowPermission;
+        impl crate::platform::PermissionGate for AllowPermission {
+            fn ensure_capture_allowed(&self) -> Result<(), ServerError> {
+                Ok(())
+            }
+        }
+
+        let dir = std::env::temp_dir()
+            .join(format!("zeuxis-test-artifact-dir-{}", std::process::id()));
+        let storage = Arc::new(crate::storage::TempPngStorage::with_settings(
+            4,
+            1_000_000,
+            Some(dir.clone()),
+            None,
+        ));
+        let server = ZeuxisScreenshotServer::with_components(
+            Arc::new(CursorWindowFallbackBackend),
+            Arc::new(FixedCursor(1, 1)),
+            Arc::new(AllowPermission),
+            storage,
+        );
+
+        let path = server.create_worker_artifact_path("capture_screen", ".png");
+
+        // Worker artifacts must be staged under the storage's configured
+        // artifact directory (honoring --artifact-dir), not a hardcoded temp dir.
+        assert_eq!(path.parent(), Some(dir.as_path()));
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        assert!(name.starts_with("zeuxis-capture_screen-"));
+        assert!(name.ends_with(".png"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

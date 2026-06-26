@@ -1,5 +1,5 @@
 DEVANA-FINDING: v1
-Priority: P1 | Confidence: high | Security-sensitive: no | Status: open
+Priority: P1 | Confidence: high | Security-sensitive: no | Status: fixed
 Location: src/mcp/tools.rs:1314 | Slug: artifact-dir-ignored-subprocess
 
 # --artifact-dir is ignored in default SubprocessWorker capture path
@@ -40,5 +40,9 @@ Operators who set a dedicated artifact directory (compliance, disk layout, clean
 
 Stage worker artifacts under `config.artifact_dir` (or a subdirectory thereof) in `create_worker_artifact_path`, and add an integration test asserting `--artifact-dir` is honored in production mode.
 
+## Status Notes
+
+- 2026-06-26: fixed. Confirmed: `create_worker_artifact_path` hardcoded `temp_dir/zeuxis-worker-artifacts`, and `adopt_artifact` → `finalize_artifact` keeps the file in place while `prune_artifacts(&path, ..)` prunes the artifact's *parent* directory and session caches track those paths — so worker-mode captures (the production `SubprocessWorker` default) never touched `config.artifact_dir`. (Also: even without `--artifact-dir`, the worker used a shared `zeuxis-worker-artifacts` dir instead of the storage's per-session dir.) Fix: added `PngStorage::artifact_dir()` (returns `TempPngStorage.artifact_dir`) and changed `create_worker_artifact_path` to stage under `self.storage.artifact_dir()`. Now worker artifacts land in the configured directory and are governed by the same retention/list/clear bookkeeping as inline captures. The `zeuxis-` filename prefix keeps prune scoped to managed files, so unrelated files in an operator-supplied dir are untouched. Updated the two test `PngStorage` mocks. Added regression test `mcp_tools_worker_artifact_path_uses_configured_artifact_dir`. Full lib (138) + integration suites pass.
+
 DEVANA-KEY: src/mcp/tools.rs:1314 | P1 | artifact-dir-ignored-subprocess
-DEVANA-SUMMARY: P1 high src/mcp/tools.rs:1314 - Default subprocess capture ignores --artifact-dir and always writes to temp_dir/zeuxis-worker-artifacts.
+DEVANA-SUMMARY: Status=fixed | P1 high src/mcp/tools.rs:1314 - Worker artifacts now stage under the storage's configured artifact_dir (via new PngStorage::artifact_dir()), so --artifact-dir is honored in SubprocessWorker mode and retention/session tracking applies.

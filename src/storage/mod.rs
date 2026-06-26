@@ -110,6 +110,12 @@ pub trait PngStorage: Send + Sync {
     fn list_session_artifacts(&self) -> Result<Vec<StoredArtifact>, ServerError>;
 
     fn clear_session_artifacts(&self) -> Result<usize, ServerError>;
+
+    /// Directory under which managed artifacts are stored. Subprocess workers
+    /// must stage their output here so that `--artifact-dir` is honored and
+    /// retention/session bookkeeping (which keys off the artifact's directory)
+    /// applies to worker-produced captures.
+    fn artifact_dir(&self) -> PathBuf;
 }
 
 #[derive(Debug, Clone)]
@@ -207,6 +213,10 @@ impl PngStorage for TempPngStorage {
         })?;
 
         self.finalize_artifact(path, capture_mode, output, width, height)
+    }
+
+    fn artifact_dir(&self) -> PathBuf {
+        self.artifact_dir.clone()
     }
 
     fn adopt_artifact(

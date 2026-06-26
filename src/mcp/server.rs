@@ -586,6 +586,10 @@ mod tests {
         fn clear_session_artifacts(&self) -> Result<usize, ServerError> {
             Ok(0)
         }
+
+        fn artifact_dir(&self) -> PathBuf {
+            std::env::temp_dir()
+        }
     }
 
     #[derive(Debug, Default)]
