@@ -143,13 +143,23 @@ pub(crate) enum CaptureExecutionMode {
     SubprocessWorker,
 }
 
+/// The most recent successful capture's artifact paired with the context that
+/// describes it. Stored as a single unit under one lock so `get_latest_capture`
+/// can never combine one capture's artifact with another capture's geometry/scale
+/// metadata when captures run concurrently.
+#[derive(Clone)]
+pub(crate) struct LatestCapture {
+    pub(crate) artifact: crate::storage::StoredArtifact,
+    pub(crate) context: crate::mcp::result::CaptureContextPayload,
+}
+
 #[derive(Clone)]
 pub struct ZeuxisScreenshotServer {
     pub(crate) backend: Arc<dyn CaptureBackend>,
     pub(crate) cursor_provider: Arc<dyn CursorProvider>,
     pub(crate) permission_gate: Arc<dyn PermissionGate>,
     pub(crate) storage: Arc<dyn PngStorage>,
-    pub(crate) last_capture_context: Arc<Mutex<Option<crate::mcp::result::CaptureContextPayload>>>,
+    pub(crate) last_capture: Arc<Mutex<Option<LatestCapture>>>,
     pub(crate) last_window_snapshot: Arc<Mutex<Option<WindowSnapshotState>>>,
     pub(crate) capture_slots: Arc<tokio::sync::Semaphore>,
     pub(crate) blocking_task_timeout: Duration,
@@ -317,7 +327,7 @@ impl ZeuxisScreenshotServer {
             cursor_provider,
             permission_gate,
             storage,
-            last_capture_context: Arc::new(Mutex::new(None)),
+            last_capture: Arc::new(Mutex::new(None)),
             last_window_snapshot: Arc::new(Mutex::new(None)),
             capture_slots: Arc::new(tokio::sync::Semaphore::new(max_concurrent_captures)),
             blocking_task_timeout,

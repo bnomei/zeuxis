@@ -32,7 +32,7 @@ use crate::{
     },
 };
 
-use super::server::{CaptureExecutionMode, ZeuxisScreenshotServer};
+use super::server::{CaptureExecutionMode, LatestCapture, ZeuxisScreenshotServer};
 
 const MAX_DELAY_SECONDS: f64 = 30.0;
 const MAX_DELAY_MILLISECONDS: i64 = 30_000;
@@ -562,28 +562,8 @@ impl ZeuxisScreenshotServer {
             }
         };
 
-        let context = self
-            .last_capture_context
-            .lock()
-            .ok()
-            .and_then(|state| state.clone())
-            .unwrap_or_else(|| result::CaptureContextPayload {
-                applied_settings: result::AppliedSettingsPayload {
-                    output_mode: "unknown".to_owned(),
-                    output_preset: None,
-                    jpeg_quality: (artifact.output_format == "jpeg")
-                        .then_some(DEFAULT_JPEG_QUALITY),
-                    max_dimension: None,
-                    delay_seconds_applied: None,
-                },
-                input_units: INPUT_UNITS_NONE.to_owned(),
-                input_width: None,
-                input_height: None,
-                source_units: SOURCE_UNITS_PIXELS.to_owned(),
-                source_width: artifact.width,
-                source_height: artifact.height,
-                target: result::CaptureTargetPayload::default(),
-            });
+        let stored = self.last_capture.lock().ok().and_then(|state| state.clone());
+        let context = latest_capture_context(stored, &artifact);
 
         info!(
             tool = "get_latest_capture",
@@ -649,7 +629,7 @@ impl ZeuxisScreenshotServer {
             }
         };
 
-        if let Ok(mut state) = self.last_capture_context.lock() {
+        if let Ok(mut state) = self.last_capture.lock() {
             *state = None;
         }
 
@@ -1248,8 +1228,14 @@ impl ZeuxisScreenshotServer {
             source_height,
             target,
         };
-        if let Ok(mut state) = self.last_capture_context.lock() {
-            *state = Some(context.clone());
+        if let Ok(mut state) = self.last_capture.lock() {
+            // Store the artifact and its context as one atomic unit so a
+            // concurrent get_latest_capture cannot pair this artifact with a
+            // different capture's context (or vice versa).
+            *state = Some(LatestCapture {
+                artifact: artifact.clone(),
+                context: context.clone(),
+            });
         }
 
         info!(
@@ -1894,6 +1880,38 @@ fn downscale_if_needed(image: image::RgbaImage, max_dimension: u32) -> image::Rg
         .to_rgba8()
 }
 
+/// Choose the capture context to report alongside `artifact` for
+/// `get_latest_capture`. The stored `last_capture` pair is adopted only when it
+/// describes the same artifact (matched by `artifact_id`). Under concurrent
+/// captures the storage "latest artifact" and the server "last capture" can
+/// originate from different captures, so on mismatch (or when nothing is stored)
+/// a default context derived from the artifact itself is returned, keeping every
+/// field of the payload coherent with the image that is actually referenced.
+fn latest_capture_context(
+    stored: Option<LatestCapture>,
+    artifact: &crate::storage::StoredArtifact,
+) -> result::CaptureContextPayload {
+    stored
+        .filter(|latest| latest.artifact.artifact_id == artifact.artifact_id)
+        .map(|latest| latest.context)
+        .unwrap_or_else(|| result::CaptureContextPayload {
+            applied_settings: result::AppliedSettingsPayload {
+                output_mode: "unknown".to_owned(),
+                output_preset: None,
+                jpeg_quality: (artifact.output_format == "jpeg").then_some(DEFAULT_JPEG_QUALITY),
+                max_dimension: None,
+                delay_seconds_applied: None,
+            },
+            input_units: INPUT_UNITS_NONE.to_owned(),
+            input_width: None,
+            input_height: None,
+            source_units: SOURCE_UNITS_PIXELS.to_owned(),
+            source_width: artifact.width,
+            source_height: artifact.height,
+            target: result::CaptureTargetPayload::default(),
+        })
+}
+
 fn status_from_result(result: Result<(), ServerError>) -> (bool, Option<String>, Option<String>) {
     match result {
         Ok(()) => (true, None, None),
@@ -2448,6 +2466,66 @@ mod tests {
         assert_eq!(output.target.window_id, Some(200));
         assert_eq!(output.input_width, Some(50));
         assert_eq!(output.input_height, Some(20));
+    }
+
+    #[test]
+    fn mcp_tools_latest_capture_context_matches_artifact_by_id() {
+        fn artifact(id: &str, width: u32, height: u32) -> crate::storage::StoredArtifact {
+            crate::storage::StoredArtifact {
+                artifact_id: id.to_owned(),
+                capture_mode: "capture_screen".to_owned(),
+                path: std::path::PathBuf::from(format!("/tmp/{id}")),
+                uri: format!("file:///tmp/{id}"),
+                output_format: "png".to_owned(),
+                mime_type: "image/png".to_owned(),
+                artifact_sha256: "00".repeat(32),
+                artifact_hmac_sha256: None,
+                width,
+                height,
+                captured_at_utc: "2026-01-01T00:00:00Z".to_owned(),
+            }
+        }
+
+        let context_a = result::CaptureContextPayload {
+            applied_settings: result::AppliedSettingsPayload {
+                output_mode: "preset".to_owned(),
+                output_preset: Some("analysis".to_owned()),
+                jpeg_quality: None,
+                max_dimension: Some(2560),
+                delay_seconds_applied: None,
+            },
+            input_units: INPUT_UNITS_POINTS.to_owned(),
+            input_width: Some(100),
+            input_height: Some(100),
+            source_units: SOURCE_UNITS_PIXELS.to_owned(),
+            source_width: 100,
+            source_height: 100,
+            target: result::CaptureTargetPayload::default(),
+        };
+        let stored = LatestCapture {
+            artifact: artifact("A.png", 100, 100),
+            context: context_a,
+        };
+
+        // Same artifact_id: the stored context is adopted verbatim.
+        let matched = latest_capture_context(Some(stored.clone()), &artifact("A.png", 100, 100));
+        assert_eq!(matched.input_width, Some(100));
+        assert_eq!(matched.source_width, 100);
+        assert_eq!(matched.applied_settings.output_mode, "preset");
+
+        // A different (e.g. concurrent) capture's artifact must NOT inherit A's
+        // geometry/scale; a default context derived from that artifact is used.
+        let b = artifact("B.png", 2560, 1440);
+        let mismatched = latest_capture_context(Some(stored.clone()), &b);
+        assert_eq!(mismatched.input_width, None);
+        assert_eq!(mismatched.source_width, 2560);
+        assert_eq!(mismatched.source_height, 1440);
+        assert_eq!(mismatched.applied_settings.output_mode, "unknown");
+
+        // Nothing stored: default context derived from the artifact.
+        let none = latest_capture_context(None, &b);
+        assert_eq!(none.input_width, None);
+        assert_eq!(none.source_width, 2560);
     }
 
     #[test]

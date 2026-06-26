@@ -1,5 +1,5 @@
 DEVANA-FINDING: v1
-Priority: P2 | Confidence: medium | Security-sensitive: no | Status: open
+Priority: P2 | Confidence: medium | Security-sensitive: no | Status: fixed
 Location: src/mcp/tools.rs:599 | Slug: latest-capture-context-mismatch
 
 # get_latest_capture pairs the latest artifact with a different capture's context
@@ -97,6 +97,7 @@ and the final `DEVANA-SUMMARY:` status. Use one of: `open`, `fixed`, `invalid`, 
 ## Status Notes
 
 - 2026-06-25: open by Devana. Initial report written from static source inspection.
+- 2026-06-26: fixed. Confirmed the two-singleton race: artifact from `storage.latest_artifact()` (set inside the permit-held blocking task) vs context from `last_capture_context` (set after the permit drops), readable independently with no shared key. Fix ties the artifact and its context together: replaced `last_capture_context: Mutex<Option<CaptureContextPayload>>` with `last_capture: Mutex<Option<LatestCapture>>` where `LatestCapture { artifact, context }` is written as one unit at capture completion (`src/mcp/tools.rs` ~1250) and cleared by `clear_session_artifacts`. `get_latest_capture` still fetches the artifact via `storage.latest_artifact()` (preserving its storage-failure/panic/no_capture_yet semantics and the existing integration tests) but now adopts the stored context only when `last_capture.artifact.artifact_id == artifact.artifact_id`; on mismatch (the concurrent-capture case) or when nothing is stored, it derives a default context from the artifact itself — so every field of the payload is always coherent with the image referenced by `path`/`uri`/`artifact_sha256`. Extracted the selection into `latest_capture_context()` and unit-tested it (`mcp_tools_latest_capture_context_matches_artifact_by_id`: id-match adopts stored context; id-mismatch yields the artifact-derived default, never the other capture's geometry). Full lib (140) + result_payload (13) + tool_calls (34) pass.
 
 DEVANA-KEY: src/mcp/tools.rs:599 | P2 | latest-capture-context-mismatch
-DEVANA-SUMMARY: Status=open | P2 medium src/mcp/tools.rs:599 - get_latest_capture merges the latest artifact with last_capture_context from two unsynchronized singletons, so under concurrent captures it returns one capture's image with another capture's geometry/scale metadata.
+DEVANA-SUMMARY: Status=fixed | P2 medium src/mcp/tools.rs:599 - get_latest_capture now stores (artifact, context) as one atomic LatestCapture unit and adopts the stored context only when its artifact_id matches the returned artifact, falling back to an artifact-derived default; concurrent captures can no longer mix one capture's image with another's geometry/scale metadata.
