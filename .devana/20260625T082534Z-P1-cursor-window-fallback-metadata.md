@@ -1,5 +1,5 @@
 DEVANA-FINDING: v1
-Priority: P1 | Confidence: high | Security-sensitive: no | Status: open
+Priority: P1 | Confidence: high | Security-sensitive: no | Status: fixed
 Location: src/mcp/tools.rs:1415 | Slug: cursor-window-fallback-metadata
 
 # capture_cursor_window reports resolved window metadata after unfiltered fallback capture
@@ -40,5 +40,9 @@ Agents acting on `target.window_id` or input dimensions will reason about the wr
 
 On fallback success, re-resolve the captured window from the image path (or capture only via one consistent selection path) and update `target`/`input_*` to match the window actually captured.
 
+## Status Notes
+
+- 2026-06-26: fixed. Confirmed the mismatch: `resolve_window_at_cursor_with_filter` selects under filtered semantics while the `capture_window_at_cursor` fallback selects the topmost window in unfiltered backend order (`select_window_at_cursor_index`), yet `target.window_id`/`input_*` were always bound to the resolved window. Fix (both `src/mcp/tools.rs` and `src/worker/child.rs`): on fallback success, re-resolve the captured window via `resolve_window_at_cursor_with_filter(.., include_system_windows = true)` — which, with no other filters, returns the first non-minimized window at the cursor in `list_windows()` order, mirroring the fallback's selection — and bind `target`/`input_*` to that window. Falls back to the resolved window only if re-resolution itself fails. Added regression test `mcp_tools_cursor_window_fallback_reports_captured_window_metadata` (filtered resolve = window 100, capture_window fails, fallback captures system overlay 200 → metadata reports 200/50x20). All 137 lib tests pass.
+
 DEVANA-KEY: src/mcp/tools.rs:1415 | P1 | cursor-window-fallback-metadata
-DEVANA-SUMMARY: P1 high src/mcp/tools.rs:1415 - capture_cursor_window fallback can capture a different window than target.window_id reports when capture_window(id) fails.
+DEVANA-SUMMARY: Status=fixed | P1 high src/mcp/tools.rs:1415 - capture_cursor_window fallback re-resolves the captured window so target.window_id/input_* describe the window actually captured, not the originally-resolved one.

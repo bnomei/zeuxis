@@ -1418,18 +1418,30 @@ fn run_capture_operation_inline(
             let cursor = cursor_provider.cursor_position()?;
             let resolved_window =
                 resolve_window_at_cursor_with_filter(backend, cursor, *include_system_windows)?;
-            let image = backend
-                .capture_window(resolved_window.id)
-                .or_else(|_| backend.capture_window_at_cursor(cursor))?;
+            let (image, captured) = match backend.capture_window(resolved_window.id) {
+                Ok(image) => (image, resolved_window),
+                Err(_) => {
+                    // Primary capture of the resolved window failed. Fall back to
+                    // capturing the topmost window under the cursor (unfiltered
+                    // backend order), then re-resolve its metadata so target/input_*
+                    // describe the window actually captured rather than the
+                    // originally-resolved one. The unfiltered re-resolution mirrors
+                    // the fallback's `select_window_at_cursor_index` selection.
+                    let image = backend.capture_window_at_cursor(cursor)?;
+                    let captured = resolve_window_at_cursor_with_filter(backend, cursor, true)
+                        .unwrap_or(resolved_window);
+                    (image, captured)
+                }
+            };
             Ok(CaptureWorkOutput {
                 image,
                 target: result::CaptureTargetPayload {
-                    window_id: Some(resolved_window.id),
+                    window_id: Some(captured.id),
                     ..result::CaptureTargetPayload::default()
                 },
                 input_units: INPUT_UNITS_POINTS.to_owned(),
-                input_width: Some(resolved_window.width),
-                input_height: Some(resolved_window.height),
+                input_width: Some(captured.width),
+                input_height: Some(captured.height),
             })
         }
         CaptureOperation::CaptureWindow { window_id } => {
@@ -2325,6 +2337,109 @@ mod tests {
         let proportional = downscale_if_needed(widescreen, 2560);
         assert_eq!(proportional.width(), 2560);
         assert_eq!(proportional.height(), 1440);
+    }
+
+    #[derive(Debug)]
+    struct CursorWindowFallbackBackend;
+
+    impl CaptureBackend for CursorWindowFallbackBackend {
+        fn list_monitors(&self) -> Result<Vec<MonitorInfo>, ServerError> {
+            Ok(Vec::new())
+        }
+
+        fn list_windows(&self) -> Result<Vec<WindowInfo>, ServerError> {
+            Ok(vec![
+                // System overlay, listed first in backend order, covers the cursor.
+                WindowInfo {
+                    id: 200,
+                    title: "Menubar".to_owned(),
+                    app: "WindowServer".to_owned(),
+                    x: 0,
+                    y: 0,
+                    width: 50,
+                    height: 20,
+                    is_focused: false,
+                    is_minimized: false,
+                },
+                // Normal window, also covers the cursor; resolved once system
+                // windows are filtered out.
+                WindowInfo {
+                    id: 100,
+                    title: "Editor".to_owned(),
+                    app: "MyApp".to_owned(),
+                    x: 0,
+                    y: 0,
+                    width: 800,
+                    height: 600,
+                    is_focused: true,
+                    is_minimized: false,
+                },
+            ])
+        }
+
+        fn capture_screen(
+            &self,
+            _monitor_id: Option<u32>,
+        ) -> Result<image::RgbaImage, ServerError> {
+            Ok(image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 0, 255])))
+        }
+
+        fn capture_window(&self, _window_id: u32) -> Result<image::RgbaImage, ServerError> {
+            // Primary capture of the resolved window always fails, forcing the
+            // cursor-window fallback path.
+            Err(ServerError::storage_failed("transient capture failure"))
+        }
+
+        fn capture_active_window(&self) -> Result<image::RgbaImage, ServerError> {
+            self.capture_screen(None)
+        }
+
+        fn capture_window_at_cursor(
+            &self,
+            _cursor: crate::capture::region::Point,
+        ) -> Result<image::RgbaImage, ServerError> {
+            self.capture_screen(None)
+        }
+
+        fn capture_cursor_region(
+            &self,
+            _cursor: crate::capture::region::Point,
+            _size: u32,
+        ) -> Result<image::RgbaImage, ServerError> {
+            self.capture_screen(None)
+        }
+
+        fn capture_rect(&self, _rect: GlobalRect) -> Result<image::RgbaImage, ServerError> {
+            self.capture_screen(None)
+        }
+    }
+
+    #[derive(Debug)]
+    struct FixedCursor(i32, i32);
+
+    impl CursorProvider for FixedCursor {
+        fn cursor_position(&self) -> Result<crate::capture::region::Point, ServerError> {
+            Ok(crate::capture::region::Point::new(self.0, self.1))
+        }
+    }
+
+    #[test]
+    fn mcp_tools_cursor_window_fallback_reports_captured_window_metadata() {
+        let backend = CursorWindowFallbackBackend;
+        let cursor = FixedCursor(5, 5);
+        let operation = CaptureOperation::CaptureCursorWindow {
+            include_system_windows: false,
+        };
+
+        let output = run_capture_operation_inline(&backend, &cursor, &operation)
+            .expect("capture succeeds via cursor fallback");
+
+        // The filtered resolve picks window 100, but capture_window(100) fails and the
+        // fallback captures the topmost unfiltered window (system overlay 200). The
+        // reported metadata must describe the window actually captured.
+        assert_eq!(output.target.window_id, Some(200));
+        assert_eq!(output.input_width, Some(50));
+        assert_eq!(output.input_height, Some(20));
     }
 
     #[test]

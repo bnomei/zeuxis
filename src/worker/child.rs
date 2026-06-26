@@ -144,18 +144,30 @@ fn execute_operation(
             let cursor = cursor_provider.cursor_position()?;
             let resolved_window =
                 resolve_window_at_cursor_with_filter(backend, cursor, *include_system_windows)?;
-            let image = backend
-                .capture_window(resolved_window.id)
-                .or_else(|_| backend.capture_window_at_cursor(cursor))?;
+            let (image, captured) = match backend.capture_window(resolved_window.id) {
+                Ok(image) => (image, resolved_window),
+                Err(_) => {
+                    // Primary capture of the resolved window failed. Fall back to
+                    // capturing the topmost window under the cursor (unfiltered
+                    // backend order), then re-resolve its metadata so target/input_*
+                    // describe the window actually captured rather than the
+                    // originally-resolved one. The unfiltered re-resolution mirrors
+                    // the fallback's `select_window_at_cursor_index` selection.
+                    let image = backend.capture_window_at_cursor(cursor)?;
+                    let captured = resolve_window_at_cursor_with_filter(backend, cursor, true)
+                        .unwrap_or(resolved_window);
+                    (image, captured)
+                }
+            };
             Ok(CaptureWorkOutput {
                 image,
                 target: result::CaptureTargetPayload {
-                    window_id: Some(resolved_window.id),
+                    window_id: Some(captured.id),
                     ..result::CaptureTargetPayload::default()
                 },
                 input_units: INPUT_UNITS_POINTS.to_owned(),
-                input_width: Some(resolved_window.width),
-                input_height: Some(resolved_window.height),
+                input_width: Some(captured.width),
+                input_height: Some(captured.height),
             })
         }
         CaptureOperation::CaptureWindow { window_id } => {
