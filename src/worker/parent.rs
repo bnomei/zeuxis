@@ -93,10 +93,22 @@ pub async fn run_worker_capture(
         )));
     }
 
+    // A clean worker encodes every outcome — success and capture errors alike —
+    // as a valid response and exits 0. Reaching this point means we already have
+    // a valid, id-matched response, so its structured outcome is authoritative
+    // even if the process then exited non-zero (e.g. a post-serialize flush/write
+    // failure after stdout was fully written). The exit status only decides the
+    // outcome when no usable response exists, which is already handled by the
+    // parse-failure path above. Surface the anomaly in logs rather than clobbering
+    // a real (possibly non-retryable) error or a successful capture with a generic
+    // retryable storage_failed.
     if !status.success() {
-        return Err(ServerError::storage_failed(format!(
-            "capture worker exited with status {status}"
-        )));
+        tracing::warn!(
+            %status,
+            request_id = %response.request_id,
+            response_ok = response.ok,
+            "capture worker exited non-zero but produced a valid response; honoring the response"
+        );
     }
 
     if response.ok {
@@ -221,6 +233,70 @@ mod tests {
             .await
             .expect_err("should fail");
         assert_eq!(error.error_code(), "storage_failed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_parent_honors_valid_response_despite_nonzero_exit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::worker::contract::{WorkerErrorPayload, WorkerResponse};
+
+        let response = WorkerResponse::error(
+            "req-1",
+            WorkerErrorPayload {
+                error_code: "window_not_found".to_owned(),
+                message: "no such window".to_owned(),
+                retryable: false,
+            },
+        );
+        let response_json = serde_json::to_string(&response).expect("serialize response");
+
+        // A worker that emits a complete, valid error response and *then* exits
+        // non-zero — simulating a post-serialize flush/abort after stdout was
+        // already fully written.
+        let dir = std::env::temp_dir().join(format!(
+            "zeuxis-worker-exit-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let script_path = dir.join("worker.sh");
+        let script =
+            format!("#!/bin/sh\ncat > /dev/null\nprintf '%s' '{response_json}'\nexit 1\n");
+        std::fs::write(&script_path, script).expect("write script");
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod");
+
+        let request = WorkerRequest {
+            v: WORKER_CONTRACT_VERSION,
+            request_id: "req-1".to_owned(),
+            operation: CaptureOperation::CaptureScreen { monitor_id: None },
+            output: WorkerOutputOptions {
+                format: WorkerOutputFormat::Png,
+                jpeg_quality: 82,
+                max_dimension: None,
+            },
+            artifact_path: "/tmp/zeuxis-parent-test.png".to_owned(),
+        };
+
+        let result = run_worker_capture(
+            &script_path,
+            &request,
+            Duration::from_secs(5),
+            Duration::from_millis(250),
+            65536,
+        )
+        .await;
+
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let error = result.expect_err("an ok=false response must surface as an error");
+        // The worker's structured error wins over the non-zero exit status; it is
+        // NOT clobbered into a generic retryable storage_failed.
+        assert_eq!(error.error_code(), "window_not_found");
     }
 
     #[test]

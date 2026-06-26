@@ -1,5 +1,5 @@
 DEVANA-FINDING: v1
-Priority: P2 | Confidence: high | Security-sensitive: no | Status: open
+Priority: P2 | Confidence: high | Security-sensitive: no | Status: fixed
 Location: src/worker/parent.rs:96 | Slug: worker-exit-status-clobbers-response
 
 # Non-zero worker exit overrides an already-parsed valid response
@@ -98,6 +98,7 @@ and the final `DEVANA-SUMMARY:` status. Use one of: `open`, `fixed`, `invalid`, 
 ## Status Notes
 
 - 2026-06-25: open by Devana. Initial report written from static source inspection.
+- 2026-06-26: fixed. Confirmed: in `run_worker_capture`, after the stdout was parsed into a valid `WorkerResponse` (`src/worker/parent.rs:82`) and the `request_id` verified (`:89`), an unconditional `if !status.success()` (`:96`) returned a generic `storage_failed` and short-circuited before the `response.ok`/`response.error` dispatch — clobbering a real (possibly non-retryable) error or a successful capture whenever the worker exited non-zero after fully writing stdout. Since a parse/partial failure already returns early at `:82`, reaching `:96` guarantees a valid id-matched response whose structured outcome is authoritative. Fix: replaced the early `storage_failed` return with a `warn!` log of the anomaly and let control fall through to the existing `response.ok` dispatch, so the worker's real `result`/`error` (with its true `error_code`/`retryable`) is returned. The exit status only decides the outcome when no usable response exists (the parse-failure path). Added regression test `worker_parent_honors_valid_response_despite_nonzero_exit` (unix): a worker script writes a valid `ok=false {window_not_found, retryable:false}` response then `exit 1`; the parent now returns `window_not_found`, not `storage_failed`. Full lib suite (141) passes.
 
 DEVANA-KEY: src/worker/parent.rs:96 | P2 | worker-exit-status-clobbers-response
-DEVANA-SUMMARY: Status=open | P2 high src/worker/parent.rs:96 - A non-zero worker exit replaces an already-parsed valid response with generic retryable storage_failed, so a real non-retryable error (or a successful capture) is misreported when the worker aborts after writing stdout.
+DEVANA-SUMMARY: Status=fixed | P2 high src/worker/parent.rs:96 - A valid id-matched worker response is now authoritative: a non-zero exit is logged but no longer overrides the structured result/error, so real non-retryable errors and successful captures are reported correctly instead of as generic retryable storage_failed.
