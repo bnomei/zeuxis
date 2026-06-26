@@ -1,5 +1,5 @@
 DEVANA-FINDING: v1
-Priority: P2 | Confidence: medium | Security-sensitive: no | Status: open
+Priority: P2 | Confidence: medium | Security-sensitive: no | Status: fixed
 Location: src/storage/mod.rs:316 | Slug: prune-deletes-concurrent-artifact
 
 # Retention prune deletes a concurrent capture's freshly written artifact
@@ -90,6 +90,7 @@ and the final `DEVANA-SUMMARY:` status. Use one of: `open`, `fixed`, `invalid`, 
 ## Status Notes
 
 - 2026-06-25: open by Devana. Initial report written from static source inspection.
+- 2026-06-26: fixed. Confirmed: `prune_artifacts_in_dir` excluded only its own `current_path`, so a concurrent capture's just-written file in the shared dir was a deletion candidate; with concurrency > `max_artifacts` one capture's prune could delete a sibling's file, and the sibling then returned `Ok` pointing to a missing path. (Note this race now also applies to worker mode after the artifact-dir-ignored-subprocess fix co-located worker artifacts in the storage dir.) Fix: added an in-flight registry to `TempPngStorage` — `in_flight: Mutex<HashSet<PathBuf>>`. `write_image` registers the artifact path immediately after `create_temp_file` (which already created the file on disk under its final, kept name); `adopt_artifact` registers at entry; both hold an RAII `InFlightGuard` that unregisters on drop after `finalize_artifact` returns. `finalize_artifact` passes a snapshot of the in-flight set to `prune_artifacts`, which now skips any candidate whose path is `current_path` **or** in the protected set. So no prune deletes a file that any capture is mid-finalize on, and every returned `Ok` references a live file at return time; the protected files are reclaimed by retention on later prunes once their captures have returned. Worst-case residual in worker mode (a prune in the narrow window between the worker writing its file and the parent entering `adopt_artifact`) yields a clean error for the losing capture, never a dangling success. Added regression test `storage_retention_protects_in_flight_concurrent_artifact`; updated the four existing prune tests for the new parameter. Full lib (142) + integration suites pass.
 
 DEVANA-KEY: src/storage/mod.rs:316 | P2 | prune-deletes-concurrent-artifact
-DEVANA-SUMMARY: Status=open | P2 medium src/storage/mod.rs:316 - Lockless retention prune deletes the oldest non-current file, so when concurrent captures exceed max_artifacts one capture deletes another's just-written artifact and the second call returns a success result pointing to a missing file.
+DEVANA-SUMMARY: Status=fixed | P2 medium src/storage/mod.rs:316 - Retention prune now skips an in-flight registry of artifacts that are mid-finalize (registered at file creation / adopt entry, released after finalize), so a concurrent capture's prune can no longer delete a sibling's just-written file and every returned Ok references a live file.

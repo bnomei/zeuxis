@@ -126,6 +126,25 @@ pub struct TempPngStorage {
     artifact_hmac_key: Option<Vec<u8>>,
     latest_artifact_cache: Arc<Mutex<Option<StoredArtifact>>>,
     session_artifacts: Arc<Mutex<Vec<StoredArtifact>>>,
+    /// Paths of artifacts that are mid-finalize. Retention prune must never
+    /// delete one of these, so a concurrent capture cannot delete the file a
+    /// sibling capture is about to return.
+    in_flight: Arc<Mutex<HashSet<PathBuf>>>,
+}
+
+/// Keeps an artifact path registered as in-flight (protected from retention
+/// prune) for the lifetime of the guard, then removes it on drop.
+struct InFlightGuard {
+    in_flight: Arc<Mutex<HashSet<PathBuf>>>,
+    path: PathBuf,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.in_flight.lock() {
+            set.remove(&self.path);
+        }
+    }
 }
 
 impl TempPngStorage {
@@ -163,7 +182,28 @@ impl TempPngStorage {
             artifact_hmac_key,
             latest_artifact_cache: Arc::new(Mutex::new(None)),
             session_artifacts: Arc::new(Mutex::new(Vec::new())),
+            in_flight: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Mark `path` as in-flight so retention prune will not delete it until the
+    /// returned guard is dropped (i.e. until this capture has finished
+    /// finalizing and returned its artifact).
+    fn register_in_flight(&self, path: &Path) -> InFlightGuard {
+        if let Ok(mut set) = self.in_flight.lock() {
+            set.insert(path.to_path_buf());
+        }
+        InFlightGuard {
+            in_flight: Arc::clone(&self.in_flight),
+            path: path.to_path_buf(),
+        }
+    }
+
+    fn in_flight_snapshot(&self) -> HashSet<PathBuf> {
+        self.in_flight
+            .lock()
+            .map(|set| set.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -182,6 +222,10 @@ impl PngStorage for TempPngStorage {
     ) -> Result<StoredArtifact, ServerError> {
         let prefix = format!("{ARTIFACT_PREFIX}{capture_mode}-");
         let mut file = self.create_temp_file(&prefix, output.format.file_suffix())?;
+        // Protect this file from a concurrent capture's retention prune for the
+        // whole write+finalize. `create_temp_file` already created the file on
+        // disk (with its final, kept name), so register it immediately.
+        let _in_flight = self.register_in_flight(file.path());
 
         let width = image.width();
         let height = image.height();
@@ -225,6 +269,9 @@ impl PngStorage for TempPngStorage {
         capture_mode: &str,
         output: CaptureOutputOptions,
     ) -> Result<StoredArtifact, ServerError> {
+        // Protect the adopted file from a concurrent capture's retention prune
+        // until this capture finishes finalizing and returns its artifact.
+        let _in_flight = self.register_in_flight(&path);
         let metadata = fs::metadata(&path).map_err(|err| {
             ServerError::storage_failed(format!(
                 "failed to inspect adopted artifact {}: {err}",
@@ -323,7 +370,11 @@ impl TempPngStorage {
         let (artifact_sha256, artifact_hmac_sha256) =
             compute_integrity_fields(&path, self.artifact_hmac_key.as_deref())?;
 
-        prune_artifacts(&path, self.retention_policy);
+        // Exclude every in-flight artifact (this capture's and any concurrent
+        // capture's) from prune, so a sibling capture's just-written file is
+        // never deleted out from under the capture that is about to return it.
+        let protected = self.in_flight_snapshot();
+        prune_artifacts(&path, self.retention_policy, &protected);
 
         let uri = Url::from_file_path(&path).map_err(|_| {
             ServerError::storage_failed(format!(
@@ -559,13 +610,18 @@ fn collect_artifacts(dir: &Path) -> Vec<ArtifactEntry> {
     artifacts
 }
 
-fn prune_artifacts(current_path: &Path, policy: RetentionPolicy) {
+fn prune_artifacts(current_path: &Path, policy: RetentionPolicy, protected: &HashSet<PathBuf>) {
     if let Some(dir) = current_path.parent() {
-        prune_artifacts_in_dir(dir, current_path, policy);
+        prune_artifacts_in_dir(dir, current_path, policy, protected);
     }
 }
 
-fn prune_artifacts_in_dir(dir: &Path, current_path: &Path, policy: RetentionPolicy) {
+fn prune_artifacts_in_dir(
+    dir: &Path,
+    current_path: &Path,
+    policy: RetentionPolicy,
+    protected: &HashSet<PathBuf>,
+) {
     let mut artifacts = collect_artifacts(dir);
     let mut total_bytes: u64 = artifacts.iter().map(|entry| entry.bytes).sum();
 
@@ -578,7 +634,7 @@ fn prune_artifacts_in_dir(dir: &Path, current_path: &Path, policy: RetentionPoli
 
         let Some(index) = artifacts
             .iter()
-            .position(|entry| entry.path != current_path)
+            .position(|entry| entry.path != current_path && !protected.contains(&entry.path))
         else {
             break;
         };
@@ -747,11 +803,43 @@ mod tests {
                 max_artifacts: 2,
                 max_total_bytes: u64::MAX,
             },
+            &HashSet::new(),
         );
 
         assert!(!oldest.exists(), "oldest file should be pruned");
         assert!(middle.exists(), "middle file should remain");
         assert!(current.exists(), "current file should remain");
+    }
+
+    #[test]
+    fn storage_retention_protects_in_flight_concurrent_artifact() {
+        let dir = tempdir().expect("tempdir");
+        // `sibling` stands in for a concurrent capture's just-written, not-yet-
+        // returned artifact in the same directory.
+        let sibling = write_artifact(dir.path(), "sibling", 8);
+        let current = write_artifact(dir.path(), "current", 8);
+
+        // With max_artifacts = 1 and two files present, an unguarded prune would
+        // delete the older `sibling`. Marking it in-flight must keep it: a
+        // concurrent capture's file is never deleted out from under it.
+        let mut protected = HashSet::new();
+        protected.insert(sibling.clone());
+
+        prune_artifacts_in_dir(
+            dir.path(),
+            &current,
+            RetentionPolicy {
+                max_artifacts: 1,
+                max_total_bytes: u64::MAX,
+            },
+            &protected,
+        );
+
+        assert!(
+            sibling.exists(),
+            "in-flight concurrent artifact must not be pruned"
+        );
+        assert!(current.exists(), "current artifact must remain");
     }
 
     #[test]
@@ -768,6 +856,7 @@ mod tests {
                 max_artifacts: 10,
                 max_total_bytes: 15,
             },
+            &HashSet::new(),
         );
 
         assert!(!oldest.exists(), "oldest file should be pruned");
@@ -787,6 +876,7 @@ mod tests {
                 max_artifacts: 0,
                 max_total_bytes: 0,
             },
+            &HashSet::new(),
         );
 
         assert!(current.exists(), "current file should remain");
@@ -812,6 +902,7 @@ mod tests {
                 max_artifacts: 1,
                 max_total_bytes: u64::MAX,
             },
+            &HashSet::new(),
         );
 
         assert!(
