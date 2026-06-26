@@ -2317,6 +2317,14 @@ mod tests {
         let scaled = downscale_if_needed(large, 1000);
         assert!(scaled.width() <= 1000);
         assert!(scaled.height() <= 1000);
+
+        // Downscaling must preserve aspect ratio: a 16:9 source must not be
+        // squashed into a square. `DynamicImage::resize` scales to fit within
+        // the bounds while preserving the ratio (unlike `resize_exact`).
+        let widescreen = image::RgbaImage::from_pixel(3840, 2160, image::Rgba([1, 2, 3, 255]));
+        let proportional = downscale_if_needed(widescreen, 2560);
+        assert_eq!(proportional.width(), 2560);
+        assert_eq!(proportional.height(), 1440);
     }
 
     #[test]
