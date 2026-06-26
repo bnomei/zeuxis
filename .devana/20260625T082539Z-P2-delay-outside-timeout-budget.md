@@ -1,5 +1,5 @@
 DEVANA-FINDING: v1
-Priority: P2 | Confidence: high | Security-sensitive: no | Status: open
+Priority: P2 | Confidence: high | Security-sensitive: no | Status: fixed
 Location: src/mcp/tools.rs:993 | Slug: delay-outside-timeout-budget
 
 # Configured capture delay runs before and outside blocking_task_timeout_ms
@@ -40,5 +40,9 @@ Agents expecting a 15-second overall cap can block for up to 45 seconds (30s del
 
 Either subtract applied delay from `blocking_task_timeout_ms`, or update README to state delay is additive and not bounded by the capture timeout.
 
+## Status Notes
+
+- 2026-06-26: fixed (documentation). Confirmed: `tokio::time::sleep(delay)` (`src/mcp/tools.rs:993-995`) runs before `blocking_phase_started = Instant::now()` (1018) and slot acquisition, so the configured delay (up to 30s) is excluded from the capture timeout budget. Resolved via docs rather than code: the timeout is deliberately scoped to the capture phase (variable `blocking_phase_started`, env `BLOCKING_TASK_TIMEOUT_MS`) and the delay is an explicit user-requested pre-capture wait — subtracting a large delay from the capture budget would cripple the feature (e.g. delay=14s + timeout=15s would near-always fail). Updated README: the `--blocking-task-timeout-ms` row now states the deadline is measured from the start of capture-slot acquisition (after any delay), and Runtime Safety Limits now states the delay is applied first and is additive to the capture timeout (total wall time up to `delay + timeout`), advising clients to size RPC timeouts accordingly. No behavior change.
+
 DEVANA-KEY: src/mcp/tools.rs:993 | P2 | delay-outside-timeout-budget
-DEVANA-SUMMARY: P2 high src/mcp/tools.rs:993 - delay_ms up to 30s runs before blocking_task_timeout_ms, so total capture wall time can far exceed the documented overall deadline.
+DEVANA-SUMMARY: Status=fixed | P2 high src/mcp/tools.rs:993 - Documented (not code-changed): delay_ms/delay_seconds is an intentional pre-capture wait, additive to and not bounded by the capture timeout; README clarified that timeout covers only the capture phase and total wall time can be delay+timeout.

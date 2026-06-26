@@ -114,6 +114,7 @@ Notes:
 
 - `delay_ms` max: `30000`
 - `delay_seconds` max: `30`
+- a requested `delay_ms`/`delay_seconds` is applied **before** the capture and is **additive** to the capture timeout (it is not counted against `--blocking-task-timeout-ms`), so the total wall time of a call can be up to `delay + capture timeout`; size client-side RPC timeouts accordingly
 - capture dimension max: `16384 x 16384`
 - capture area max: `40,000,000` pixels
 - capture work runs in a dedicated subprocess worker and is gated by a semaphore
@@ -135,7 +136,7 @@ Precedence is `CLI flag > env var > default` (no config files).
 | `--max-artifacts` | `ZEUXIS_MAX_ARTIFACTS` | `64` | Max retained Zeuxis temp image files (`1..=10000`). |
 | `--max-artifact-bytes` | `ZEUXIS_MAX_ARTIFACT_BYTES` | `536870912` | Max retained Zeuxis temp image bytes (`1024..=10737418240`). |
 | `--artifact-dir` | `ZEUXIS_ARTIFACT_DIR` | system temp dir | Directory for managed capture artifacts. |
-| `--blocking-task-timeout-ms` | `ZEUXIS_BLOCKING_TASK_TIMEOUT_MS` | `15000` | Overall capture deadline before timeout/worker termination (`100..=300000`). |
+| `--blocking-task-timeout-ms` | `ZEUXIS_BLOCKING_TASK_TIMEOUT_MS` | `15000` | Deadline for the capture phase before timeout/worker termination, measured from the start of capture-slot acquisition — i.e. after any requested `delay_ms`/`delay_seconds`, which run first and are not counted against it (`100..=300000`). |
 | `--worker-kill-grace-ms` | `ZEUXIS_WORKER_KILL_GRACE_MS` | `250` | Grace period to wait after soft terminate before hard-kill (`10..=30000`). |
 | `--max-worker-stdout-bytes` | `ZEUXIS_MAX_WORKER_STDOUT_BYTES` | `65536` | Max worker IPC stdout bytes accepted by parent (`1024..=4194304`). |
 | `--capture-sound-file` | `ZEUXIS_CAPTURE_SOUND_FILE` | platform default | Optional custom sound file for capture-complete feedback when `play_sound=true`. |
