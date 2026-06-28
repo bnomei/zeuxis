@@ -1,3 +1,9 @@
+//! Screenshot artifact persistence, retention pruning, and session-scoped caches.
+//!
+//! Managed captures live under a configured artifact directory. Retention and session
+//! bookkeeping share in-flight protection so concurrent finalizes cannot delete a
+//! sibling capture's file before it is returned.
+
 use std::{
     collections::HashSet,
     fs,
@@ -27,6 +33,7 @@ use crate::{
 const ARTIFACT_PREFIX: &str = "zeuxis-";
 const ARTIFACT_SUFFIXES: [&str; 3] = [".png", ".jpg", ".webp"];
 
+/// Encoded image format used for persisted capture artifacts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureOutputFormat {
     Png,
@@ -35,6 +42,7 @@ pub enum CaptureOutputFormat {
 }
 
 impl CaptureOutputFormat {
+    /// Snake_case format name stored in artifact metadata and MCP payloads.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Png => "png",
@@ -43,6 +51,7 @@ impl CaptureOutputFormat {
         }
     }
 
+    /// File extension used when writing managed artifacts to disk.
     pub const fn file_suffix(self) -> &'static str {
         match self {
             Self::Png => ".png",
@@ -51,6 +60,7 @@ impl CaptureOutputFormat {
         }
     }
 
+    /// MIME type attached to MCP resource links for the encoded artifact.
     pub const fn mime_type(self) -> &'static str {
         match self {
             Self::Png => "image/png",
@@ -60,6 +70,7 @@ impl CaptureOutputFormat {
     }
 }
 
+/// Encoding options applied when writing or adopting a capture artifact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CaptureOutputOptions {
     pub format: CaptureOutputFormat,
@@ -75,6 +86,10 @@ impl Default for CaptureOutputOptions {
     }
 }
 
+/// Metadata for a managed screenshot artifact.
+///
+/// The path and URI are local-only. Hash fields cover the encoded file bytes;
+/// the HMAC field is present only when a runtime HMAC key is configured.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredArtifact {
     pub artifact_id: String,
@@ -90,7 +105,18 @@ pub struct StoredArtifact {
     pub captured_at_utc: String,
 }
 
+/// RAII guard for artifact paths that must survive retention pruning.
+pub trait ArtifactProtectionGuard: Send {}
+
+struct NoopArtifactProtectionGuard;
+
+impl ArtifactProtectionGuard for NoopArtifactProtectionGuard {}
+
+/// Artifact storage boundary for encoded screenshot files and session caches.
+///
+/// Despite the historical name, implementations may store PNG, JPEG, or WebP.
 pub trait PngStorage: Send + Sync {
+    /// Encodes and persists a new image artifact.
     fn write_image(
         &self,
         image: RgbaImage,
@@ -98,6 +124,7 @@ pub trait PngStorage: Send + Sync {
         output: CaptureOutputOptions,
     ) -> Result<StoredArtifact, ServerError>;
 
+    /// Adopts an already encoded worker artifact into storage bookkeeping.
     fn adopt_artifact(
         &self,
         path: PathBuf,
@@ -105,13 +132,25 @@ pub trait PngStorage: Send + Sync {
         output: CaptureOutputOptions,
     ) -> Result<StoredArtifact, ServerError>;
 
+    /// Protects a not-yet-finalized artifact path from retention pruning.
+    fn protect_artifact_path(&self, _path: &Path) -> Box<dyn ArtifactProtectionGuard> {
+        Box::new(NoopArtifactProtectionGuard)
+    }
+
+    /// Returns the latest artifact still present in the current server session.
     fn latest_artifact(&self) -> Result<StoredArtifact, ServerError>;
 
+    /// Lists live artifacts created during the current server session.
     fn list_session_artifacts(&self) -> Result<Vec<StoredArtifact>, ServerError>;
 
+    /// Deletes known session artifacts and returns the number of files removed.
     fn clear_session_artifacts(&self) -> Result<usize, ServerError>;
+
+    /// Directory where managed artifacts are written and retention is applied.
+    fn artifact_dir(&self) -> PathBuf;
 }
 
+/// Local filesystem artifact store with retention pruning and session state.
 #[derive(Debug, Clone)]
 pub struct TempPngStorage {
     retention_policy: RetentionPolicy,
@@ -120,9 +159,29 @@ pub struct TempPngStorage {
     artifact_hmac_key: Option<Vec<u8>>,
     latest_artifact_cache: Arc<Mutex<Option<StoredArtifact>>>,
     session_artifacts: Arc<Mutex<Vec<StoredArtifact>>>,
+    /// Paths mid-finalize; retention prune skips these so a concurrent capture
+    /// cannot delete a file a sibling finalize is about to return.
+    in_flight: Arc<Mutex<HashSet<PathBuf>>>,
+}
+
+/// Registers an artifact path as in-flight until drop, shielding it from retention prune.
+struct InFlightGuard {
+    in_flight: Arc<Mutex<HashSet<PathBuf>>>,
+    path: PathBuf,
+}
+
+impl ArtifactProtectionGuard for InFlightGuard {}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.in_flight.lock() {
+            set.remove(&self.path);
+        }
+    }
 }
 
 impl TempPngStorage {
+    /// Creates storage in an auto-managed temp directory with default retention.
     pub fn new() -> Self {
         Self::with_settings(
             DEFAULT_MAX_ARTIFACTS,
@@ -132,10 +191,14 @@ impl TempPngStorage {
         )
     }
 
+    /// Creates storage with explicit retention limits in an auto-managed temp directory.
     pub fn with_retention_policy(max_artifacts: usize, max_total_bytes: u64) -> Self {
         Self::with_settings(max_artifacts, max_total_bytes, None, None)
     }
 
+    /// Creates storage with explicit retention, artifact directory, and HMAC settings.
+    ///
+    /// Retention values are clamped to supported runtime ranges.
     pub fn with_settings(
         max_artifacts: usize,
         max_total_bytes: u64,
@@ -157,7 +220,25 @@ impl TempPngStorage {
             artifact_hmac_key,
             latest_artifact_cache: Arc::new(Mutex::new(None)),
             session_artifacts: Arc::new(Mutex::new(Vec::new())),
+            in_flight: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    fn register_in_flight(&self, path: &Path) -> InFlightGuard {
+        if let Ok(mut set) = self.in_flight.lock() {
+            set.insert(path.to_path_buf());
+        }
+        InFlightGuard {
+            in_flight: Arc::clone(&self.in_flight),
+            path: path.to_path_buf(),
+        }
+    }
+
+    fn in_flight_snapshot(&self) -> HashSet<PathBuf> {
+        self.in_flight
+            .lock()
+            .map(|set| set.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -176,6 +257,7 @@ impl PngStorage for TempPngStorage {
     ) -> Result<StoredArtifact, ServerError> {
         let prefix = format!("{ARTIFACT_PREFIX}{capture_mode}-");
         let mut file = self.create_temp_file(&prefix, output.format.file_suffix())?;
+        let _in_flight = self.register_in_flight(file.path());
 
         let width = image.width();
         let height = image.height();
@@ -209,12 +291,21 @@ impl PngStorage for TempPngStorage {
         self.finalize_artifact(path, capture_mode, output, width, height)
     }
 
+    fn artifact_dir(&self) -> PathBuf {
+        self.artifact_dir.clone()
+    }
+
+    fn protect_artifact_path(&self, path: &Path) -> Box<dyn ArtifactProtectionGuard> {
+        Box::new(self.register_in_flight(path))
+    }
+
     fn adopt_artifact(
         &self,
         path: PathBuf,
         capture_mode: &str,
         output: CaptureOutputOptions,
     ) -> Result<StoredArtifact, ServerError> {
+        let _in_flight = self.register_in_flight(&path);
         let metadata = fs::metadata(&path).map_err(|err| {
             ServerError::storage_failed(format!(
                 "failed to inspect adopted artifact {}: {err}",
@@ -251,6 +342,8 @@ impl PngStorage for TempPngStorage {
         };
 
         if !artifact.path.exists() {
+            // Latest capture is a live session pointer; if the file disappeared,
+            // clear it and ask the client to take a new screenshot.
             *latest = None;
             return Err(ServerError::no_capture_yet(
                 "latest screenshot artifact is unavailable; capture a new screenshot",
@@ -266,6 +359,8 @@ impl PngStorage for TempPngStorage {
             .lock()
             .map_err(|_| ServerError::storage_failed("session artifact cache lock poisoned"))?;
 
+        // Session listing reflects live files and drops entries that were
+        // removed by retention, clearing, or external filesystem cleanup.
         artifacts.retain(|artifact| artifact.path.exists());
         let mut items = artifacts.clone();
         items.sort_by(|a, b| b.captured_at_utc.cmp(&a.captured_at_utc));
@@ -283,6 +378,7 @@ impl PngStorage for TempPngStorage {
         let mut cleared_paths = HashSet::with_capacity(artifacts.len());
         for artifact in artifacts {
             let path = artifact.path;
+            // Count successful deletes only; missing files are already gone.
             if path.exists() && fs::remove_file(&path).is_ok() {
                 deleted += 1;
             }
@@ -313,7 +409,8 @@ impl TempPngStorage {
         let (artifact_sha256, artifact_hmac_sha256) =
             compute_integrity_fields(&path, self.artifact_hmac_key.as_deref())?;
 
-        prune_artifacts(&path, self.retention_policy);
+        let protected = self.in_flight_snapshot();
+        prune_artifacts(&path, self.retention_policy, &protected);
 
         let uri = Url::from_file_path(&path).map_err(|_| {
             ServerError::storage_failed(format!(
@@ -344,8 +441,31 @@ impl TempPngStorage {
             artifacts.retain(|entry| entry.path != artifact.path);
             artifacts.push(artifact.clone());
             if artifacts.len() > self.retention_policy.max_artifacts {
+                // Eviction deletes drained files when possible. Failed deletes keep
+                // metadata in the cache so clear_session_artifacts can retry later.
                 let overflow = artifacts.len() - self.retention_policy.max_artifacts;
-                artifacts.drain(0..overflow);
+                let mut retained_evictions = Vec::new();
+                for evicted in artifacts.drain(0..overflow) {
+                    if evicted.path.exists() {
+                        match fs::remove_file(&evicted.path) {
+                            Ok(()) => {}
+                            Err(err) => {
+                                if evicted.path.exists() {
+                                    warn!(
+                                        path = %evicted.path.display(),
+                                        error = %err,
+                                        "session artifact eviction could not remove file; keeping metadata for later cleanup"
+                                    );
+                                    retained_evictions.push(evicted);
+                                }
+                            }
+                        }
+                    }
+                }
+                if !retained_evictions.is_empty() {
+                    retained_evictions.extend(artifacts.drain(..));
+                    *artifacts = retained_evictions;
+                }
             }
         }
         if let Ok(mut latest) = self.latest_artifact_cache.lock() {
@@ -385,6 +505,8 @@ impl TempPngStorage {
         if self.auto_managed_artifact_dir {
             use std::os::unix::fs::PermissionsExt;
 
+            // Tighten only Zeuxis-created temp directories; user-provided
+            // artifact directories keep operator-managed permissions.
             let mut permissions = fs::metadata(&self.artifact_dir)
                 .map_err(|err| {
                     ServerError::storage_failed(format!(
@@ -540,13 +662,18 @@ fn collect_artifacts(dir: &Path) -> Vec<ArtifactEntry> {
     artifacts
 }
 
-fn prune_artifacts(current_path: &Path, policy: RetentionPolicy) {
+fn prune_artifacts(current_path: &Path, policy: RetentionPolicy, protected: &HashSet<PathBuf>) {
     if let Some(dir) = current_path.parent() {
-        prune_artifacts_in_dir(dir, current_path, policy);
+        prune_artifacts_in_dir(dir, current_path, policy, protected);
     }
 }
 
-fn prune_artifacts_in_dir(dir: &Path, current_path: &Path, policy: RetentionPolicy) {
+fn prune_artifacts_in_dir(
+    dir: &Path,
+    current_path: &Path,
+    policy: RetentionPolicy,
+    protected: &HashSet<PathBuf>,
+) {
     let mut artifacts = collect_artifacts(dir);
     let mut total_bytes: u64 = artifacts.iter().map(|entry| entry.bytes).sum();
 
@@ -559,7 +686,7 @@ fn prune_artifacts_in_dir(dir: &Path, current_path: &Path, policy: RetentionPoli
 
         let Some(index) = artifacts
             .iter()
-            .position(|entry| entry.path != current_path)
+            .position(|entry| entry.path != current_path && !protected.contains(&entry.path))
         else {
             break;
         };
@@ -660,6 +787,135 @@ mod tests {
     }
 
     #[test]
+    fn storage_finalize_deletes_files_evicted_from_session_cache() {
+        let dir = tempdir().expect("tempdir");
+        let other = tempdir().expect("other tempdir");
+        let stale_path = write_artifact(other.path(), "stale", 8);
+
+        let storage = TempPngStorage::with_settings(
+            1,
+            DEFAULT_MAX_ARTIFACT_BYTES,
+            Some(dir.path().to_path_buf()),
+            None,
+        );
+        storage
+            .session_artifacts
+            .lock()
+            .expect("lock")
+            .push(StoredArtifact {
+                artifact_id: "zeuxis-capture_screen-stale.png".to_owned(),
+                capture_mode: "capture_screen".to_owned(),
+                uri: Url::from_file_path(&stale_path)
+                    .expect("file uri")
+                    .to_string(),
+                path: stale_path.clone(),
+                output_format: "png".to_owned(),
+                mime_type: "image/png".to_owned(),
+                artifact_sha256: "00".repeat(32),
+                artifact_hmac_sha256: None,
+                width: 4,
+                height: 3,
+                captured_at_utc: "2026-01-01T00:00:00Z".to_owned(),
+            });
+
+        let new_path = write_artifact(dir.path(), "new", 8);
+        storage
+            .finalize_artifact(
+                new_path,
+                "capture_screen",
+                CaptureOutputOptions::default(),
+                4,
+                3,
+            )
+            .expect("finalize");
+
+        assert!(
+            !stale_path.exists(),
+            "evicted session-cache file must be deleted, not orphaned"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_finalize_keeps_evicted_metadata_when_delete_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("tempdir");
+        let other = tempdir().expect("other tempdir");
+        let stale_path = write_artifact(other.path(), "stale", 8);
+
+        let storage = TempPngStorage::with_settings(
+            1,
+            DEFAULT_MAX_ARTIFACT_BYTES,
+            Some(dir.path().to_path_buf()),
+            None,
+        );
+        storage
+            .session_artifacts
+            .lock()
+            .expect("lock")
+            .push(StoredArtifact {
+                artifact_id: "zeuxis-capture_screen-stale.png".to_owned(),
+                capture_mode: "capture_screen".to_owned(),
+                uri: Url::from_file_path(&stale_path)
+                    .expect("file uri")
+                    .to_string(),
+                path: stale_path.clone(),
+                output_format: "png".to_owned(),
+                mime_type: "image/png".to_owned(),
+                artifact_sha256: "00".repeat(32),
+                artifact_hmac_sha256: None,
+                width: 4,
+                height: 3,
+                captured_at_utc: "2026-01-01T00:00:00Z".to_owned(),
+            });
+
+        let mut readonly = fs::metadata(other.path())
+            .expect("metadata before chmod")
+            .permissions();
+        readonly.set_mode(0o500);
+        fs::set_permissions(other.path(), readonly).expect("make other dir readonly");
+
+        let new_path = write_artifact(dir.path(), "new", 8);
+        storage
+            .finalize_artifact(
+                new_path.clone(),
+                "capture_screen",
+                CaptureOutputOptions::default(),
+                4,
+                3,
+            )
+            .expect("finalize");
+
+        assert!(
+            stale_path.exists(),
+            "failed eviction delete should leave the file on disk"
+        );
+        assert!(
+            storage
+                .session_artifacts
+                .lock()
+                .expect("lock")
+                .iter()
+                .any(|artifact| artifact.path == stale_path),
+            "failed eviction delete must retain metadata for later cleanup"
+        );
+
+        let mut writable = fs::metadata(other.path())
+            .expect("metadata before restore")
+            .permissions();
+        writable.set_mode(0o700);
+        fs::set_permissions(other.path(), writable).expect("restore other dir writable");
+
+        let deleted = storage
+            .clear_session_artifacts()
+            .expect("clear session artifacts");
+        assert_eq!(deleted, 2);
+        assert!(!stale_path.exists(), "stale file should be retried");
+        assert!(!new_path.exists(), "current file should also be deleted");
+    }
+
+    #[test]
     fn storage_retention_prunes_oldest_files_by_count_and_keeps_current() {
         let dir = tempdir().expect("tempdir");
         let oldest = write_artifact(dir.path(), "oldest", 8);
@@ -673,11 +929,83 @@ mod tests {
                 max_artifacts: 2,
                 max_total_bytes: u64::MAX,
             },
+            &HashSet::new(),
         );
 
         assert!(!oldest.exists(), "oldest file should be pruned");
         assert!(middle.exists(), "middle file should remain");
         assert!(current.exists(), "current file should remain");
+    }
+
+    #[test]
+    fn storage_retention_protects_in_flight_concurrent_artifact() {
+        let dir = tempdir().expect("tempdir");
+        let sibling = write_artifact(dir.path(), "sibling", 8);
+        let current = write_artifact(dir.path(), "current", 8);
+
+        let mut protected = HashSet::new();
+        protected.insert(sibling.clone());
+
+        prune_artifacts_in_dir(
+            dir.path(),
+            &current,
+            RetentionPolicy {
+                max_artifacts: 1,
+                max_total_bytes: u64::MAX,
+            },
+            &protected,
+        );
+
+        assert!(
+            sibling.exists(),
+            "in-flight concurrent artifact must not be pruned"
+        );
+        assert!(current.exists(), "current artifact must remain");
+    }
+
+    #[test]
+    fn storage_protect_artifact_path_registers_path_until_guard_drops() {
+        let dir = tempdir().expect("tempdir");
+        let storage = TempPngStorage::with_settings(
+            1,
+            DEFAULT_MAX_ARTIFACT_BYTES,
+            Some(dir.path().to_path_buf()),
+            None,
+        );
+        let worker = write_artifact(dir.path(), "worker", 8);
+        let current = write_artifact(dir.path(), "current", 8);
+
+        {
+            let _guard = storage.protect_artifact_path(&worker);
+            prune_artifacts_in_dir(
+                dir.path(),
+                &current,
+                RetentionPolicy {
+                    max_artifacts: 1,
+                    max_total_bytes: u64::MAX,
+                },
+                &storage.in_flight_snapshot(),
+            );
+
+            assert!(worker.exists(), "protected worker artifact must remain");
+            assert!(current.exists(), "current artifact must remain");
+        }
+
+        prune_artifacts_in_dir(
+            dir.path(),
+            &current,
+            RetentionPolicy {
+                max_artifacts: 1,
+                max_total_bytes: u64::MAX,
+            },
+            &storage.in_flight_snapshot(),
+        );
+
+        assert!(
+            !worker.exists(),
+            "worker artifact should be prunable after guard drop"
+        );
+        assert!(current.exists(), "current artifact must remain");
     }
 
     #[test]
@@ -694,6 +1022,7 @@ mod tests {
                 max_artifacts: 10,
                 max_total_bytes: 15,
             },
+            &HashSet::new(),
         );
 
         assert!(!oldest.exists(), "oldest file should be pruned");
@@ -713,6 +1042,7 @@ mod tests {
                 max_artifacts: 0,
                 max_total_bytes: 0,
             },
+            &HashSet::new(),
         );
 
         assert!(current.exists(), "current file should remain");
@@ -738,6 +1068,7 @@ mod tests {
                 max_artifacts: 1,
                 max_total_bytes: u64::MAX,
             },
+            &HashSet::new(),
         );
 
         assert!(

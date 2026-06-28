@@ -1,15 +1,25 @@
+//! Cursor position providers for cursor-dependent capture tools.
+//!
+//! Positions are global logical desktop points. Providers may fail when the
+//! desktop session or operating-system accessibility permissions block cursor
+//! access.
+
 use device_query::{DeviceQuery, DeviceState};
 
 use crate::{capture::region::Point, mcp::errors::ServerError};
 
+/// Boundary for reading the current global cursor point.
 pub trait CursorProvider: Send + Sync {
+    /// Returns the cursor in global logical desktop points, or `cursor_unavailable`.
     fn cursor_position(&self) -> Result<Point, ServerError>;
 }
 
+/// Cursor provider backed by the `device_query` crate.
 #[derive(Debug, Clone, Default)]
 pub struct DeviceQueryCursorProvider;
 
 impl DeviceQueryCursorProvider {
+    /// Creates a provider that reads cursor position from the current session.
     pub const fn new() -> Self {
         Self
     }

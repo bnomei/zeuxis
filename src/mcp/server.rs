@@ -1,3 +1,9 @@
+//! Server composition, component injection, and rmcp stdio serving.
+//!
+//! Production construction runs capture work in a subprocess worker, while
+//! component constructors keep capture inline for tests and embedders that own
+//! their backend, storage, and permission boundaries.
+
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -26,10 +32,13 @@ use crate::{
     storage::{PngStorage, TempPngStorage},
 };
 
+/// Side-effect boundary for successful-capture feedback.
 pub trait CaptureFeedbackEmitter: Send + Sync {
+    /// Emits best-effort feedback after a successful capture.
     fn emit_capture(&self);
 }
 
+/// Feedback emitter that writes an ASCII bell to stderr.
 #[derive(Debug, Default)]
 pub struct TerminalBellFeedbackEmitter;
 
@@ -39,12 +48,14 @@ impl CaptureFeedbackEmitter for TerminalBellFeedbackEmitter {
     }
 }
 
+/// Feedback emitter that tries a platform shutter sound before falling back to bell.
 #[derive(Debug, Clone, Default)]
 pub struct PlatformSoundFeedbackEmitter {
     capture_sound_file: Option<PathBuf>,
 }
 
 impl PlatformSoundFeedbackEmitter {
+    /// Creates a sound emitter with an optional operator-supplied sound file.
     pub const fn new(capture_sound_file: Option<PathBuf>) -> Self {
         Self { capture_sound_file }
     }
@@ -72,11 +83,11 @@ fn try_emit_platform_feedback_sound(capture_sound_file: Option<&std::path::Path>
 
     #[cfg(target_os = "linux")]
     {
-        return spawn_feedback_sound_process("canberra-gtk-play", &["-i", "camera-shutter"])
+        spawn_feedback_sound_process("canberra-gtk-play", &["-i", "camera-shutter"])
             || spawn_feedback_sound_process(
                 "paplay",
                 &["/usr/share/sounds/freedesktop/stereo/camera-shutter.oga"],
-            );
+            )
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -94,9 +105,9 @@ fn try_emit_custom_sound_file(path: &std::path::Path) -> bool {
 
     #[cfg(target_os = "linux")]
     {
-        return spawn_feedback_sound_process("paplay", &[&sound_path])
+        spawn_feedback_sound_process("paplay", &[&sound_path])
             || spawn_feedback_sound_process("aplay", &[&sound_path])
-            || spawn_feedback_sound_process("canberra-gtk-play", &["--file", &sound_path]);
+            || spawn_feedback_sound_process("canberra-gtk-play", &["--file", &sound_path])
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -129,6 +140,7 @@ fn spawn_feedback_sound_process(command: &str, args: &[&str]) -> bool {
     }
 }
 
+/// Latest `list_windows` snapshot accepted by `capture_window`.
 #[derive(Debug, Clone)]
 pub(crate) struct WindowSnapshotState {
     pub snapshot_id: String,
@@ -137,19 +149,31 @@ pub(crate) struct WindowSnapshotState {
     pub windows: Vec<WindowInfo>,
 }
 
+/// Execution path for blocking capture work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CaptureExecutionMode {
+    /// Run capture in `spawn_blocking` inside the MCP server process.
     Inline,
+    /// Run capture in the hidden `__worker` subprocess protocol.
     SubprocessWorker,
 }
 
+/// Latest successful capture's artifact and context, stored under one lock so
+/// concurrent `get_latest_capture` calls cannot pair mismatched metadata.
+#[derive(Clone)]
+pub(crate) struct LatestCapture {
+    pub(crate) artifact: crate::storage::StoredArtifact,
+    pub(crate) context: crate::mcp::result::CaptureContextPayload,
+}
+
+/// MCP screenshot server with injected capture, cursor, permission, and storage boundaries.
 #[derive(Clone)]
 pub struct ZeuxisScreenshotServer {
     pub(crate) backend: Arc<dyn CaptureBackend>,
     pub(crate) cursor_provider: Arc<dyn CursorProvider>,
     pub(crate) permission_gate: Arc<dyn PermissionGate>,
     pub(crate) storage: Arc<dyn PngStorage>,
-    pub(crate) last_capture_context: Arc<Mutex<Option<crate::mcp::result::CaptureContextPayload>>>,
+    pub(crate) last_capture: Arc<Mutex<Option<LatestCapture>>>,
     pub(crate) last_window_snapshot: Arc<Mutex<Option<WindowSnapshotState>>>,
     pub(crate) capture_slots: Arc<tokio::sync::Semaphore>,
     pub(crate) blocking_task_timeout: Duration,
@@ -174,10 +198,15 @@ struct ServerSettings {
 }
 
 impl ZeuxisScreenshotServer {
+    /// Creates a production server from process environment runtime config.
     pub fn new() -> Self {
         Self::with_runtime_config(RuntimeConfig::from_env())
     }
 
+    /// Creates a production server from explicit runtime config.
+    ///
+    /// Capture work runs in subprocess worker mode, and storage retention/HMAC
+    /// settings are copied from the provided config.
     pub fn with_runtime_config(config: RuntimeConfig) -> Self {
         let worker_executable = std::env::current_exe().ok();
         Self::with_components_and_settings(
@@ -204,6 +233,7 @@ impl ZeuxisScreenshotServer {
         )
     }
 
+    /// Creates a server from injected components using inline capture execution.
     pub fn with_components(
         backend: Arc<dyn CaptureBackend>,
         cursor_provider: Arc<dyn CursorProvider>,
@@ -230,6 +260,7 @@ impl ZeuxisScreenshotServer {
         )
     }
 
+    /// Creates an inline server from injected components with explicit parallelism.
     pub fn with_components_and_parallelism(
         backend: Arc<dyn CaptureBackend>,
         cursor_provider: Arc<dyn CursorProvider>,
@@ -251,6 +282,7 @@ impl ZeuxisScreenshotServer {
         )
     }
 
+    /// Creates an inline server from injected components and feedback emitter.
     pub fn with_components_and_feedback(
         backend: Arc<dyn CaptureBackend>,
         cursor_provider: Arc<dyn CursorProvider>,
@@ -271,6 +303,7 @@ impl ZeuxisScreenshotServer {
         )
     }
 
+    /// Creates an inline server with explicit capture concurrency and timeout limits.
     pub fn with_components_and_limits(
         backend: Arc<dyn CaptureBackend>,
         cursor_provider: Arc<dyn CursorProvider>,
@@ -317,7 +350,7 @@ impl ZeuxisScreenshotServer {
             cursor_provider,
             permission_gate,
             storage,
-            last_capture_context: Arc::new(Mutex::new(None)),
+            last_capture: Arc::new(Mutex::new(None)),
             last_window_snapshot: Arc::new(Mutex::new(None)),
             capture_slots: Arc::new(tokio::sync::Semaphore::new(max_concurrent_captures)),
             blocking_task_timeout,
@@ -330,6 +363,7 @@ impl ZeuxisScreenshotServer {
         }
     }
 
+    /// Serves MCP over stdio until the client disconnects.
     pub async fn serve_stdio(self) -> Result<(), rmcp::RmcpError> {
         let service = self.serve(rmcp::transport::stdio()).await?;
         service.waiting().await?;
@@ -585,6 +619,10 @@ mod tests {
 
         fn clear_session_artifacts(&self) -> Result<usize, ServerError> {
             Ok(0)
+        }
+
+        fn artifact_dir(&self) -> PathBuf {
+            std::env::temp_dir()
         }
     }
 

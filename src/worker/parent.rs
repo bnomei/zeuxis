@@ -1,3 +1,8 @@
+//! Parent-side supervisor for hidden capture worker processes.
+//!
+//! The parent owns the worker timeout, stdout byte budget, request/response ID
+//! validation, and graceful-then-hard termination before storage adoption.
+
 use std::{path::Path, time::Duration};
 
 use tokio::{
@@ -11,6 +16,10 @@ use super::contract::{WorkerRequest, WorkerSuccessPayload, parse_response_json};
 
 const HARD_KILL_WAIT_FALLBACK: Duration = Duration::from_millis(2_000);
 
+/// Runs one capture request in a subprocess worker and returns its success payload.
+///
+/// A valid response with the expected `request_id` is authoritative; process
+/// exit status is only diagnostic after the protocol payload has been accepted.
 pub async fn run_worker_capture(
     executable: &Path,
     request: &WorkerRequest,
@@ -51,6 +60,8 @@ pub async fn run_worker_capture(
     });
     let read_task = tokio::spawn(read_stdout_limited(stdout, max_stdout_bytes));
 
+    // Concurrent pipe tasks avoid deadlock when the child waits for stdin EOF
+    // while the parent is also waiting for the child to exit.
     let timed_wait = tokio::time::timeout(timeout, child.wait()).await;
     let status = match timed_wait {
         Ok(Ok(status)) => status,
@@ -93,10 +104,15 @@ pub async fn run_worker_capture(
         )));
     }
 
+    // A valid id-matched response is authoritative even when the process exits
+    // non-zero afterward (e.g. post-serialize flush failure after stdout was written).
     if !status.success() {
-        return Err(ServerError::storage_failed(format!(
-            "capture worker exited with status {status}"
-        )));
+        tracing::warn!(
+            %status,
+            request_id = %response.request_id,
+            response_ok = response.ok,
+            "capture worker exited non-zero but produced a valid response; honoring the response"
+        );
     }
 
     if response.ok {
@@ -158,10 +174,18 @@ async fn terminate_worker(
         }
     }
 
-    if tokio::time::timeout(kill_grace, child.wait()).await.is_ok() {
-        return Ok(());
+    match tokio::time::timeout(kill_grace, child.wait()).await {
+        Ok(Ok(_status)) => return Ok(()),
+        Ok(Err(err)) => {
+            tracing::warn!(
+                error = %err,
+                "capture worker wait failed during grace period; escalating to hard kill"
+            );
+        }
+        Err(_) => {}
     }
 
+    // Grace period ended or wait errored without confirming exit; escalate to hard kill.
     child.kill().await.map_err(|err| {
         ServerError::storage_failed(format!("failed to hard-kill capture worker: {err}"))
     })?;
@@ -210,6 +234,62 @@ mod tests {
             .await
             .expect_err("should fail");
         assert_eq!(error.error_code(), "storage_failed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_parent_honors_valid_response_despite_nonzero_exit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::worker::contract::{WorkerErrorPayload, WorkerResponse};
+
+        let response = WorkerResponse::error(
+            "req-1",
+            WorkerErrorPayload {
+                error_code: "window_not_found".to_owned(),
+                message: "no such window".to_owned(),
+                retryable: false,
+            },
+        );
+        let response_json = serde_json::to_string(&response).expect("serialize response");
+
+        let dir =
+            std::env::temp_dir().join(format!("zeuxis-worker-exit-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let script_path = dir.join("worker.sh");
+        let script = format!("#!/bin/sh\ncat > /dev/null\nprintf '%s' '{response_json}'\nexit 1\n");
+        std::fs::write(&script_path, script).expect("write script");
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod");
+
+        let request = WorkerRequest {
+            v: WORKER_CONTRACT_VERSION,
+            request_id: "req-1".to_owned(),
+            operation: CaptureOperation::CaptureScreen { monitor_id: None },
+            output: WorkerOutputOptions {
+                format: WorkerOutputFormat::Png,
+                jpeg_quality: 82,
+                max_dimension: None,
+            },
+            artifact_path: "/tmp/zeuxis-parent-test.png".to_owned(),
+        };
+
+        let result = run_worker_capture(
+            &script_path,
+            &request,
+            Duration::from_secs(5),
+            Duration::from_millis(250),
+            65536,
+        )
+        .await;
+
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let error = result.expect_err("an ok=false response must surface as an error");
+        assert_eq!(error.error_code(), "window_not_found");
     }
 
     #[test]

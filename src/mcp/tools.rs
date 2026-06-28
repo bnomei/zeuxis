@@ -1,3 +1,9 @@
+//! MCP tool schemas, validation, and capture execution lifecycle.
+//!
+//! Tool handlers validate client parameters, apply additive pre-capture delays,
+//! enforce concurrency/timeouts, and route capture work through inline or
+//! subprocess worker execution before returning structured MCP results.
+
 use std::{
     path::{Path, PathBuf},
     sync::{
@@ -32,7 +38,7 @@ use crate::{
     },
 };
 
-use super::server::{CaptureExecutionMode, ZeuxisScreenshotServer};
+use super::server::{CaptureExecutionMode, LatestCapture, ZeuxisScreenshotServer};
 
 const MAX_DELAY_SECONDS: f64 = 30.0;
 const MAX_DELAY_MILLISECONDS: i64 = 30_000;
@@ -50,6 +56,7 @@ const INPUT_UNITS_POINTS: &str = "points";
 const INPUT_UNITS_NONE: &str = "none";
 const SOURCE_UNITS_PIXELS: &str = "pixels";
 
+/// Named output profiles for common agent screenshot workflows.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputPreset {
@@ -62,6 +69,7 @@ pub enum OutputPreset {
     Compact,
 }
 
+/// Encoded artifact formats accepted in custom output mode.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputFormat {
@@ -80,6 +88,7 @@ impl OutputFormat {
     }
 }
 
+/// Selects shorthand preset output or explicit custom encoding settings.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputMode {
@@ -87,21 +96,26 @@ pub enum OutputMode {
     Custom,
 }
 
+/// Detailed output settings for preset or custom mode.
+///
+/// Preset mode accepts only `preset`; custom mode requires `format` and accepts
+/// `max_dimension`, plus `jpeg_quality` only for JPEG output.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct OutputParams {
     pub mode: OutputMode,
-    /// Used only when mode is preset.
+    /// Preset selected when `mode` is `preset`.
     pub preset: Option<OutputPreset>,
-    /// Used only when mode is custom.
+    /// Format selected when `mode` is `custom`.
     pub format: Option<OutputFormat>,
-    /// Used only when mode is custom and format is jpeg.
+    /// JPEG quality selected only for custom JPEG output.
     #[schemars(range(min = MIN_JPEG_QUALITY, max = MAX_JPEG_QUALITY))]
     pub jpeg_quality: Option<i64>,
-    /// Used only when mode is custom.
+    /// Longest output side in pixels for custom downscaling.
     #[schemars(range(min = MIN_OUTPUT_MAX_DIMENSION, max = MAX_OUTPUT_MAX_DIMENSION))]
     pub max_dimension: Option<i64>,
 }
 
+/// Output parameter accepted as either preset shorthand or a detailed object.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(untagged)]
 pub enum OutputInput {
@@ -138,6 +152,11 @@ struct ParsedCommonParams {
     output: ResolvedOutputSettings,
 }
 
+/// Capture parameters shared by every capture tool.
+///
+/// `delay_ms` and `delay_seconds` are aliases and must not be supplied together.
+/// The delay runs before permission/capture work and is additive to the blocking
+/// capture timeout.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, Default)]
 pub struct CommonCaptureParams {
     /// Optional delay before capture in milliseconds (0..=30000). Prefer this for deterministic clients.
@@ -153,9 +172,11 @@ pub struct CommonCaptureParams {
     pub output: Option<OutputInput>,
 }
 
+/// Empty parameter object for monitor discovery.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, Default)]
 pub struct ListMonitorsParams {}
 
+/// Filters for window discovery and snapshot creation.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, Default)]
 pub struct ListWindowsParams {
     /// Return only focused windows.
@@ -168,18 +189,23 @@ pub struct ListWindowsParams {
     pub title_contains: Option<String>,
 }
 
+/// Empty parameter object for runtime diagnostics.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, Default)]
 pub struct GetRuntimeDiagnosticsParams {}
 
+/// Empty parameter object for returning the current latest capture.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, Default)]
 pub struct GetLatestCaptureParams {}
 
+/// Empty parameter object for clearing session artifacts.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, Default)]
 pub struct ClearSessionArtifactsParams {}
 
+/// Empty parameter object for listing session artifacts.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, Default)]
 pub struct ListSessionArtifactsParams {}
 
+/// Parameters for full-monitor capture.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, Default)]
 pub struct CaptureScreenParams {
     #[serde(flatten)]
@@ -188,6 +214,7 @@ pub struct CaptureScreenParams {
     pub monitor_id: Option<u32>,
 }
 
+/// Parameters for deterministic window capture from a `list_windows` snapshot.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct CaptureWindowParams {
     #[serde(flatten)]
@@ -198,6 +225,7 @@ pub struct CaptureWindowParams {
     pub window_id: u32,
 }
 
+/// Parameters for capturing the window under the cursor.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, Default)]
 pub struct CaptureCursorWindowParams {
     #[serde(flatten)]
@@ -206,6 +234,7 @@ pub struct CaptureCursorWindowParams {
     pub include_system_windows: Option<bool>,
 }
 
+/// Parameters for square cursor-centered region capture.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct CaptureCursorRegionParams {
     #[serde(flatten)]
@@ -215,6 +244,7 @@ pub struct CaptureCursorRegionParams {
     pub size: i64,
 }
 
+/// Parameters for global rectangle capture.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct CaptureRectParams {
     #[serde(flatten)]
@@ -231,6 +261,7 @@ pub struct CaptureRectParams {
     pub height: i64,
 }
 
+/// Parameters for monitor-local rectangle capture.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct CaptureMonitorRegionParams {
     #[serde(flatten)]
@@ -562,28 +593,12 @@ impl ZeuxisScreenshotServer {
             }
         };
 
-        let context = self
-            .last_capture_context
+        let stored = self
+            .last_capture
             .lock()
             .ok()
-            .and_then(|state| state.clone())
-            .unwrap_or_else(|| result::CaptureContextPayload {
-                applied_settings: result::AppliedSettingsPayload {
-                    output_mode: "unknown".to_owned(),
-                    output_preset: None,
-                    jpeg_quality: (artifact.output_format == "jpeg")
-                        .then_some(DEFAULT_JPEG_QUALITY),
-                    max_dimension: None,
-                    delay_seconds_applied: None,
-                },
-                input_units: INPUT_UNITS_NONE.to_owned(),
-                input_width: None,
-                input_height: None,
-                source_units: SOURCE_UNITS_PIXELS.to_owned(),
-                source_width: artifact.width,
-                source_height: artifact.height,
-                target: result::CaptureTargetPayload::default(),
-            });
+            .and_then(|state| state.clone());
+        let context = latest_capture_context(stored, &artifact);
 
         info!(
             tool = "get_latest_capture",
@@ -649,7 +664,7 @@ impl ZeuxisScreenshotServer {
             }
         };
 
-        if let Ok(mut state) = self.last_capture_context.lock() {
+        if let Ok(mut state) = self.last_capture.lock() {
             *state = None;
         }
 
@@ -991,6 +1006,8 @@ impl ZeuxisScreenshotServer {
         let applied_delay_ms = parsed_common.delay.as_ref().map(Duration::as_millis);
 
         if let Some(delay) = parsed_common.delay {
+            // Delay is additive to the blocking capture timeout; clients use it
+            // to let the desktop reach the intended visual state before capture.
             tokio::time::sleep(delay).await;
         }
 
@@ -1017,6 +1034,8 @@ impl ZeuxisScreenshotServer {
         let timeout_message = format!("capture timed out after {}ms", timeout.as_millis());
         let blocking_phase_started = Instant::now();
 
+        // From here the timeout budget covers capture-slot acquisition plus the
+        // blocking capture/storage phase, not the optional pre-capture delay.
         let permit =
             match tokio::time::timeout(timeout, self.capture_slots.clone().acquire_owned()).await {
                 Ok(Ok(permit)) => permit,
@@ -1145,7 +1164,11 @@ impl ZeuxisScreenshotServer {
                     capture_mode,
                     output_for_request.format.file_suffix(),
                 );
+                let _artifact_protection = storage.protect_artifact_path(&artifact_path);
                 let request_id = next_worker_request_id();
+                // The child writes encoded bytes to this path; the parent then
+                // adopts the artifact to centralize hashes, HMAC, retention, and
+                // session cache bookkeeping.
                 let request = WorkerRequest {
                     v: WORKER_CONTRACT_VERSION,
                     request_id: request_id.clone(),
@@ -1170,44 +1193,44 @@ impl ZeuxisScreenshotServer {
                     }
                 };
 
-                let now = std::time::Instant::now();
-                if now > deadline {
+                let adoption_timeout = deadline.saturating_duration_since(Instant::now());
+                if adoption_timeout.is_zero() {
                     let _ = cleanup_worker_artifact_path(Path::new(&worker_result.artifact_path));
-                    Err(ServerError::storage_failed(
+                    return result::error_result(&ServerError::storage_failed(
                         timeout_message_for_worker.clone(),
-                    ))
-                } else {
-                    let remaining = deadline.saturating_duration_since(now);
-                    let storage = Arc::clone(&storage);
-                    let artifact_path = PathBuf::from(worker_result.artifact_path.clone());
-                    let output_options = CaptureOutputOptions {
-                        format: output_for_request.format.to_storage(),
-                        jpeg_quality: output_for_request.jpeg_quality,
-                    };
-                    let adopted = run_blocking_with_timeout(
-                        remaining,
-                        timeout_message_for_worker.clone(),
-                        "capture adopt worker task failed",
-                        move || storage.adopt_artifact(artifact_path, capture_mode, output_options),
-                    )
-                    .await;
+                    ));
+                }
 
-                    match adopted {
-                        Ok(artifact) => Ok((
-                            artifact,
-                            worker_result.source_width,
-                            worker_result.source_height,
-                            worker_result.target,
-                            worker_result.input_units,
-                            worker_result.input_width,
-                            worker_result.input_height,
-                        )),
-                        Err(error) => {
-                            let _ = cleanup_worker_artifact_path(Path::new(
-                                &worker_result.artifact_path,
-                            ));
-                            Err(error)
-                        }
+                // Keep adoption inside the original blocking timeout. The worker
+                // already consumed part of this deadline before returning.
+                let storage = Arc::clone(&storage);
+                let artifact_path = PathBuf::from(worker_result.artifact_path.clone());
+                let output_options = CaptureOutputOptions {
+                    format: output_for_request.format.to_storage(),
+                    jpeg_quality: output_for_request.jpeg_quality,
+                };
+                let adopted = run_blocking_with_timeout(
+                    adoption_timeout,
+                    timeout_message_for_worker.clone(),
+                    "capture adopt worker task failed",
+                    move || storage.adopt_artifact(artifact_path, capture_mode, output_options),
+                )
+                .await;
+
+                match adopted {
+                    Ok(artifact) => Ok((
+                        artifact,
+                        worker_result.source_width,
+                        worker_result.source_height,
+                        worker_result.target,
+                        worker_result.input_units,
+                        worker_result.input_width,
+                        worker_result.input_height,
+                    )),
+                    Err(error) => {
+                        let _ =
+                            cleanup_worker_artifact_path(Path::new(&worker_result.artifact_path));
+                        Err(error)
                     }
                 }
             }
@@ -1247,8 +1270,13 @@ impl ZeuxisScreenshotServer {
             source_height,
             target,
         };
-        if let Ok(mut state) = self.last_capture_context.lock() {
-            *state = Some(context.clone());
+        if let Ok(mut state) = self.last_capture.lock() {
+            // Store artifact and context as one unit so concurrent get_latest_capture
+            // cannot pair this artifact with another capture's geometry.
+            *state = Some(LatestCapture {
+                artifact: artifact.clone(),
+                context: context.clone(),
+            });
         }
 
         info!(
@@ -1285,6 +1313,8 @@ impl ZeuxisScreenshotServer {
         snapshot_id: &str,
         window_id: u32,
     ) -> Result<(), ServerError> {
+        // Window IDs are snapshot-scoped. Reject stale IDs before launching
+        // potentially expensive capture work against a changed desktop.
         let state = self
             .last_window_snapshot
             .lock()
@@ -1311,8 +1341,11 @@ impl ZeuxisScreenshotServer {
         Ok(())
     }
 
+    /// Creates a managed worker artifact path under the storage artifact directory.
+    /// Callers hold storage protection before spawning the worker so retention
+    /// cannot prune the not-yet-adopted child output.
     fn create_worker_artifact_path(&self, capture_mode: &str, suffix: &str) -> PathBuf {
-        let base = std::env::temp_dir().join("zeuxis-worker-artifacts");
+        let base = self.storage.artifact_dir();
         let _ = std::fs::create_dir_all(&base);
         let artifact_id = next_worker_artifact_id();
         base.join(format!("zeuxis-{capture_mode}-{artifact_id}{suffix}"))
@@ -1418,18 +1451,26 @@ fn run_capture_operation_inline(
             let cursor = cursor_provider.cursor_position()?;
             let resolved_window =
                 resolve_window_at_cursor_with_filter(backend, cursor, *include_system_windows)?;
-            let image = backend
-                .capture_window(resolved_window.id)
-                .or_else(|_| backend.capture_window_at_cursor(cursor))?;
+            let (image, captured) = match backend.capture_window(resolved_window.id) {
+                Ok(image) => (image, resolved_window),
+                Err(_) => {
+                    // Resolved window capture failed; grab the topmost cursor window
+                    // (unfiltered) and report metadata for the window actually captured.
+                    let image = backend.capture_window_at_cursor(cursor)?;
+                    let captured = resolve_window_at_cursor_with_filter(backend, cursor, true)
+                        .unwrap_or(resolved_window);
+                    (image, captured)
+                }
+            };
             Ok(CaptureWorkOutput {
                 image,
                 target: result::CaptureTargetPayload {
-                    window_id: Some(resolved_window.id),
+                    window_id: Some(captured.id),
                     ..result::CaptureTargetPayload::default()
                 },
                 input_units: INPUT_UNITS_POINTS.to_owned(),
-                input_width: Some(resolved_window.width),
-                input_height: Some(resolved_window.height),
+                input_width: Some(captured.width),
+                input_height: Some(captured.height),
             })
         }
         CaptureOperation::CaptureWindow { window_id } => {
@@ -1553,6 +1594,8 @@ fn filter_windows(mut windows: Vec<WindowInfo>, params: &ListWindowsParams) -> V
 }
 
 fn is_system_window(window: &WindowInfo) -> bool {
+    // System-window detection is heuristic UI chrome filtering, not a platform
+    // guarantee; clients can opt back in with include_system_windows=true.
     let app = window.app.trim();
     let title = window.title.trim();
     if app.is_empty() {
@@ -1872,6 +1915,34 @@ fn downscale_if_needed(image: image::RgbaImage, max_dimension: u32) -> image::Rg
             image::imageops::FilterType::Triangle,
         )
         .to_rgba8()
+}
+
+/// Context for `get_latest_capture` when storage latest and server last_capture may
+/// disagree under concurrent captures. Adopts the stored pair only when `artifact_id`
+/// matches; otherwise derives a coherent default from the artifact alone.
+fn latest_capture_context(
+    stored: Option<LatestCapture>,
+    artifact: &crate::storage::StoredArtifact,
+) -> result::CaptureContextPayload {
+    stored
+        .filter(|latest| latest.artifact.artifact_id == artifact.artifact_id)
+        .map(|latest| latest.context)
+        .unwrap_or_else(|| result::CaptureContextPayload {
+            applied_settings: result::AppliedSettingsPayload {
+                output_mode: "unknown".to_owned(),
+                output_preset: None,
+                jpeg_quality: (artifact.output_format == "jpeg").then_some(DEFAULT_JPEG_QUALITY),
+                max_dimension: None,
+                delay_seconds_applied: None,
+            },
+            input_units: INPUT_UNITS_NONE.to_owned(),
+            input_width: None,
+            input_height: None,
+            source_units: SOURCE_UNITS_PIXELS.to_owned(),
+            source_width: artifact.width,
+            source_height: artifact.height,
+            target: result::CaptureTargetPayload::default(),
+        })
 }
 
 fn status_from_result(result: Result<(), ServerError>) -> (bool, Option<String>, Option<String>) {
@@ -2317,6 +2388,205 @@ mod tests {
         let scaled = downscale_if_needed(large, 1000);
         assert!(scaled.width() <= 1000);
         assert!(scaled.height() <= 1000);
+
+        let widescreen = image::RgbaImage::from_pixel(3840, 2160, image::Rgba([1, 2, 3, 255]));
+        let proportional = downscale_if_needed(widescreen, 2560);
+        assert_eq!(proportional.width(), 2560);
+        assert_eq!(proportional.height(), 1440);
+    }
+
+    #[derive(Debug)]
+    struct CursorWindowFallbackBackend;
+
+    impl CaptureBackend for CursorWindowFallbackBackend {
+        fn list_monitors(&self) -> Result<Vec<MonitorInfo>, ServerError> {
+            Ok(Vec::new())
+        }
+
+        fn list_windows(&self) -> Result<Vec<WindowInfo>, ServerError> {
+            Ok(vec![
+                WindowInfo {
+                    id: 200,
+                    title: "Menubar".to_owned(),
+                    app: "WindowServer".to_owned(),
+                    x: 0,
+                    y: 0,
+                    width: 50,
+                    height: 20,
+                    is_focused: false,
+                    is_minimized: false,
+                },
+                WindowInfo {
+                    id: 100,
+                    title: "Editor".to_owned(),
+                    app: "MyApp".to_owned(),
+                    x: 0,
+                    y: 0,
+                    width: 800,
+                    height: 600,
+                    is_focused: true,
+                    is_minimized: false,
+                },
+            ])
+        }
+
+        fn capture_screen(
+            &self,
+            _monitor_id: Option<u32>,
+        ) -> Result<image::RgbaImage, ServerError> {
+            Ok(image::RgbaImage::from_pixel(
+                2,
+                2,
+                image::Rgba([0, 0, 0, 255]),
+            ))
+        }
+
+        fn capture_window(&self, _window_id: u32) -> Result<image::RgbaImage, ServerError> {
+            Err(ServerError::storage_failed("transient capture failure"))
+        }
+
+        fn capture_active_window(&self) -> Result<image::RgbaImage, ServerError> {
+            self.capture_screen(None)
+        }
+
+        fn capture_window_at_cursor(
+            &self,
+            _cursor: crate::capture::region::Point,
+        ) -> Result<image::RgbaImage, ServerError> {
+            self.capture_screen(None)
+        }
+
+        fn capture_cursor_region(
+            &self,
+            _cursor: crate::capture::region::Point,
+            _size: u32,
+        ) -> Result<image::RgbaImage, ServerError> {
+            self.capture_screen(None)
+        }
+
+        fn capture_rect(&self, _rect: GlobalRect) -> Result<image::RgbaImage, ServerError> {
+            self.capture_screen(None)
+        }
+    }
+
+    #[derive(Debug)]
+    struct FixedCursor(i32, i32);
+
+    impl CursorProvider for FixedCursor {
+        fn cursor_position(&self) -> Result<crate::capture::region::Point, ServerError> {
+            Ok(crate::capture::region::Point::new(self.0, self.1))
+        }
+    }
+
+    #[test]
+    fn mcp_tools_cursor_window_fallback_reports_captured_window_metadata() {
+        let backend = CursorWindowFallbackBackend;
+        let cursor = FixedCursor(5, 5);
+        let operation = CaptureOperation::CaptureCursorWindow {
+            include_system_windows: false,
+        };
+
+        let output = run_capture_operation_inline(&backend, &cursor, &operation)
+            .expect("capture succeeds via cursor fallback");
+
+        assert_eq!(output.target.window_id, Some(200));
+        assert_eq!(output.input_width, Some(50));
+        assert_eq!(output.input_height, Some(20));
+    }
+
+    #[test]
+    fn mcp_tools_latest_capture_context_matches_artifact_by_id() {
+        fn artifact(id: &str, width: u32, height: u32) -> crate::storage::StoredArtifact {
+            crate::storage::StoredArtifact {
+                artifact_id: id.to_owned(),
+                capture_mode: "capture_screen".to_owned(),
+                path: std::path::PathBuf::from(format!("/tmp/{id}")),
+                uri: format!("file:///tmp/{id}"),
+                output_format: "png".to_owned(),
+                mime_type: "image/png".to_owned(),
+                artifact_sha256: "00".repeat(32),
+                artifact_hmac_sha256: None,
+                width,
+                height,
+                captured_at_utc: "2026-01-01T00:00:00Z".to_owned(),
+            }
+        }
+
+        let context_a = result::CaptureContextPayload {
+            applied_settings: result::AppliedSettingsPayload {
+                output_mode: "preset".to_owned(),
+                output_preset: Some("analysis".to_owned()),
+                jpeg_quality: None,
+                max_dimension: Some(2560),
+                delay_seconds_applied: None,
+            },
+            input_units: INPUT_UNITS_POINTS.to_owned(),
+            input_width: Some(100),
+            input_height: Some(100),
+            source_units: SOURCE_UNITS_PIXELS.to_owned(),
+            source_width: 100,
+            source_height: 100,
+            target: result::CaptureTargetPayload::default(),
+        };
+        let stored = LatestCapture {
+            artifact: artifact("A.png", 100, 100),
+            context: context_a,
+        };
+
+        let matched = latest_capture_context(Some(stored.clone()), &artifact("A.png", 100, 100));
+        assert_eq!(matched.input_width, Some(100));
+        assert_eq!(matched.source_width, 100);
+        assert_eq!(matched.applied_settings.output_mode, "preset");
+
+        let b = artifact("B.png", 2560, 1440);
+        let mismatched = latest_capture_context(Some(stored.clone()), &b);
+        assert_eq!(mismatched.input_width, None);
+        assert_eq!(mismatched.source_width, 2560);
+        assert_eq!(mismatched.source_height, 1440);
+        assert_eq!(mismatched.applied_settings.output_mode, "unknown");
+
+        let none = latest_capture_context(None, &b);
+        assert_eq!(none.input_width, None);
+        assert_eq!(none.source_width, 2560);
+    }
+
+    #[test]
+    fn mcp_tools_worker_artifact_path_uses_configured_artifact_dir() {
+        use std::sync::Arc;
+
+        struct AllowPermission;
+        impl crate::platform::PermissionGate for AllowPermission {
+            fn ensure_capture_allowed(&self) -> Result<(), ServerError> {
+                Ok(())
+            }
+        }
+
+        let dir =
+            std::env::temp_dir().join(format!("zeuxis-test-artifact-dir-{}", std::process::id()));
+        let storage = Arc::new(crate::storage::TempPngStorage::with_settings(
+            4,
+            1_000_000,
+            Some(dir.clone()),
+            None,
+        ));
+        let server = ZeuxisScreenshotServer::with_components(
+            Arc::new(CursorWindowFallbackBackend),
+            Arc::new(FixedCursor(1, 1)),
+            Arc::new(AllowPermission),
+            storage,
+        );
+
+        let path = server.create_worker_artifact_path("capture_screen", ".png");
+
+        assert_eq!(path.parent(), Some(dir.as_path()));
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        assert!(name.starts_with("zeuxis-capture_screen-"));
+        assert!(name.ends_with(".png"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

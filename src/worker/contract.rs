@@ -1,3 +1,9 @@
+//! Versioned JSON contract between the MCP parent and capture worker process.
+//!
+//! Requests and responses are exchanged over stdio. The contract carries enough
+//! target, dimension, and error metadata for the parent to adopt an encoded
+//! artifact without rerunning capture work.
+
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -8,8 +14,10 @@ use crate::{
     storage::CaptureOutputFormat,
 };
 
+/// Worker JSON schema version; parent and child must agree before capture runs.
 pub const WORKER_CONTRACT_VERSION: u32 = 1;
 
+/// Output format names used in worker JSON requests and responses.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerOutputFormat {
@@ -62,6 +70,7 @@ impl From<CaptureOutputFormat> for WorkerOutputFormat {
     }
 }
 
+/// Capture operation requested from the subprocess worker.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureOperation {
@@ -94,6 +103,7 @@ pub enum CaptureOperation {
 }
 
 impl CaptureOperation {
+    /// MCP tool name used as `capture_mode` in stored artifact metadata.
     pub const fn capture_mode(&self) -> &'static str {
         match self {
             Self::CaptureScreen { .. } => "capture_screen",
@@ -107,6 +117,7 @@ impl CaptureOperation {
     }
 }
 
+/// Encoding and downscaling settings sent to the worker.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerOutputOptions {
     pub format: WorkerOutputFormat,
@@ -114,6 +125,10 @@ pub struct WorkerOutputOptions {
     pub max_dimension: Option<u32>,
 }
 
+/// Parent-to-child capture request.
+///
+/// `artifact_path` is chosen by the parent so the child writes directly into the
+/// storage artifact directory that will later adopt the file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerRequest {
     pub v: u32,
@@ -124,6 +139,7 @@ pub struct WorkerRequest {
 }
 
 impl WorkerRequest {
+    /// Checks contract version, `request_id`, and `artifact_path` before capture.
     pub fn validate(&self) -> Result<(), WorkerErrorPayload> {
         if self.v != WORKER_CONTRACT_VERSION {
             return Err(WorkerErrorPayload::invalid_params(format!(
@@ -145,6 +161,7 @@ impl WorkerRequest {
     }
 }
 
+/// Successful worker result for an encoded artifact on disk.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkerSuccessPayload {
     pub artifact_path: String,
@@ -160,6 +177,7 @@ pub struct WorkerSuccessPayload {
     pub target: CaptureTargetPayload,
 }
 
+/// Child-to-parent response with exclusive success or error payloads.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkerResponse {
     pub v: u32,
@@ -172,6 +190,7 @@ pub struct WorkerResponse {
 }
 
 impl WorkerResponse {
+    /// Builds an `ok=true` response carrying encoded artifact metadata.
     pub fn success(request_id: impl Into<String>, result: WorkerSuccessPayload) -> Self {
         Self {
             v: WORKER_CONTRACT_VERSION,
@@ -182,6 +201,7 @@ impl WorkerResponse {
         }
     }
 
+    /// Builds an `ok=false` response with a stable worker error payload.
     pub fn error(request_id: impl Into<String>, error: WorkerErrorPayload) -> Self {
         Self {
             v: WORKER_CONTRACT_VERSION,
@@ -192,6 +212,7 @@ impl WorkerResponse {
         }
     }
 
+    /// Ensures version, `request_id`, and exclusive success/error payloads match `ok`.
     pub fn validate(&self) -> Result<(), WorkerErrorPayload> {
         if self.v != WORKER_CONTRACT_VERSION {
             return Err(WorkerErrorPayload::invalid_params(format!(
@@ -231,6 +252,7 @@ impl WorkerResponse {
     }
 }
 
+/// Worker error payload preserving MCP error code and retryability semantics.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerErrorPayload {
     pub error_code: String,
@@ -239,6 +261,7 @@ pub struct WorkerErrorPayload {
 }
 
 impl WorkerErrorPayload {
+    /// Worker-side `storage_failed` with retryable semantics preserved for the parent.
     pub fn storage_failed(message: impl Into<String>) -> Self {
         Self {
             error_code: ErrorCode::StorageFailed.as_str().to_owned(),
@@ -247,6 +270,7 @@ impl WorkerErrorPayload {
         }
     }
 
+    /// Worker-side `invalid_params` for malformed requests or responses.
     pub fn invalid_params(message: impl Into<String>) -> Self {
         Self {
             error_code: ErrorCode::InvalidParams.as_str().to_owned(),
@@ -255,6 +279,7 @@ impl WorkerErrorPayload {
         }
     }
 
+    /// Serializes a capture-time `ServerError` into worker JSON.
     pub fn from_server_error(error: &ServerError) -> Self {
         Self {
             error_code: error.error_code().to_owned(),
@@ -263,6 +288,7 @@ impl WorkerErrorPayload {
         }
     }
 
+    /// Rehydrates worker JSON errors into MCP `ServerError` values for tool results.
     pub fn to_server_error(self) -> ServerError {
         match self.error_code.as_str() {
             "permission_denied" => ServerError::permission_denied(self.message),
@@ -285,6 +311,7 @@ impl WorkerErrorPayload {
     }
 }
 
+/// Decodes and validates a worker request JSON document.
 pub fn parse_request_json(input: &str) -> Result<WorkerRequest, WorkerErrorPayload> {
     let request: WorkerRequest = serde_json::from_str(input).map_err(|error| {
         WorkerErrorPayload::invalid_params(format!("failed to decode worker request JSON: {error}"))
@@ -293,6 +320,7 @@ pub fn parse_request_json(input: &str) -> Result<WorkerRequest, WorkerErrorPaylo
     Ok(request)
 }
 
+/// Decodes and validates a worker response JSON document.
 pub fn parse_response_json(input: &str) -> Result<WorkerResponse, WorkerErrorPayload> {
     let response: WorkerResponse = serde_json::from_str(input).map_err(|error| {
         WorkerErrorPayload::invalid_params(format!(

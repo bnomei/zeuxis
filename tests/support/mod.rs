@@ -498,6 +498,10 @@ impl PngStorage for MockStorage {
         self.latest_artifact.lock().expect("lock").take();
         Ok(deleted)
     }
+
+    fn artifact_dir(&self) -> std::path::PathBuf {
+        std::env::temp_dir()
+    }
 }
 
 #[derive(Debug)]

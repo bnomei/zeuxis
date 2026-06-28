@@ -1,5 +1,12 @@
+//! Stable structured error taxonomy for MCP tool responses.
+//!
+//! Error code strings and retryability are part of the client contract: tools
+//! return them in `structured_content` so agents can decide whether to retry,
+//! ask for permissions, or change capture parameters.
+
 use serde_json::json;
 
+/// Machine-readable error codes returned by Zeuxis tools.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCode {
     PermissionDenied,
@@ -15,6 +22,7 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
+    /// Stable snake_case string returned in MCP `structured_content.error_code`.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::PermissionDenied => "permission_denied",
@@ -31,6 +39,10 @@ impl ErrorCode {
     }
 }
 
+/// Error value carried through capture, storage, and MCP result boundaries.
+///
+/// `retryable` describes whether the same call might succeed after an external
+/// state change, such as permission approval or filesystem recovery.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("{message}")]
 pub struct ServerError {
@@ -40,6 +52,7 @@ pub struct ServerError {
 }
 
 impl ServerError {
+    /// Constructs an error with explicit code, message, and retryability.
     pub fn new(code: ErrorCode, message: impl Into<String>, retryable: bool) -> Self {
         Self {
             code,
@@ -88,22 +101,27 @@ impl ServerError {
         Self::new(ErrorCode::InvalidParams, message, false)
     }
 
+    /// Typed error code for branching inside the server.
     pub const fn code(&self) -> ErrorCode {
         self.code
     }
 
+    /// Stable snake_case code for MCP clients and worker JSON.
     pub const fn error_code(&self) -> &'static str {
         self.code.as_str()
     }
 
+    /// Human-readable detail safe to surface in tool text content.
     pub fn message(&self) -> &str {
         &self.message
     }
 
+    /// Whether the same call might succeed after an external state change.
     pub const fn retryable(&self) -> bool {
         self.retryable
     }
 
+    /// JSON object with `error_code`, `message`, and `retryable` fields.
     pub fn structured_content(&self) -> serde_json::Value {
         json!({
             "error_code": self.error_code(),

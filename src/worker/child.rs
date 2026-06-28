@@ -1,3 +1,9 @@
+//! Hidden subprocess worker entrypoint for blocking desktop capture.
+//!
+//! The worker reads one JSON request from stdin, writes the encoded artifact to
+//! the parent-selected path, and prints one JSON response to stdout. Logs are
+//! intentionally absent from stdout because the parent treats it as protocol.
+
 use std::{
     error::Error,
     fs,
@@ -32,6 +38,7 @@ struct CaptureWorkOutput {
     input_height: Option<u32>,
 }
 
+/// Runs the one-shot stdio worker protocol used by the hidden `__worker` command.
 pub fn run_stdio_worker() -> Result<(), Box<dyn Error>> {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
@@ -108,6 +115,8 @@ fn execute_operation(
     match operation {
         CaptureOperation::CaptureScreen { monitor_id } => {
             let image = backend.capture_screen(*monitor_id)?;
+            // Metadata lookup after capture is best effort; the captured image is
+            // authoritative if monitor discovery changes between calls.
             let resolved_monitor = resolve_monitor_at_capture(backend, *monitor_id).ok();
             let resolved_monitor_id = resolved_monitor
                 .as_ref()
@@ -126,6 +135,8 @@ fn execute_operation(
         }
         CaptureOperation::CaptureActiveWindow => {
             let image = backend.capture_active_window()?;
+            // Metadata lookup after capture is best effort; the captured image is
+            // authoritative if focus changes between calls.
             let resolved_window = resolve_active_window(backend).ok();
             Ok(CaptureWorkOutput {
                 image,
@@ -144,18 +155,26 @@ fn execute_operation(
             let cursor = cursor_provider.cursor_position()?;
             let resolved_window =
                 resolve_window_at_cursor_with_filter(backend, cursor, *include_system_windows)?;
-            let image = backend
-                .capture_window(resolved_window.id)
-                .or_else(|_| backend.capture_window_at_cursor(cursor))?;
+            let (image, captured) = match backend.capture_window(resolved_window.id) {
+                Ok(image) => (image, resolved_window),
+                Err(_) => {
+                    // Resolved window capture failed; grab the topmost cursor window
+                    // (unfiltered) and report metadata for the window actually captured.
+                    let image = backend.capture_window_at_cursor(cursor)?;
+                    let captured = resolve_window_at_cursor_with_filter(backend, cursor, true)
+                        .unwrap_or(resolved_window);
+                    (image, captured)
+                }
+            };
             Ok(CaptureWorkOutput {
                 image,
                 target: result::CaptureTargetPayload {
-                    window_id: Some(resolved_window.id),
+                    window_id: Some(captured.id),
                     ..result::CaptureTargetPayload::default()
                 },
                 input_units: INPUT_UNITS_POINTS.to_owned(),
-                input_width: Some(resolved_window.width),
-                input_height: Some(resolved_window.height),
+                input_width: Some(captured.width),
+                input_height: Some(captured.height),
             })
         }
         CaptureOperation::CaptureWindow { window_id } => {
@@ -256,6 +275,8 @@ fn execute_operation(
 }
 
 fn validate_capture_dimensions(width: u32, height: u32) -> Result<(), ServerError> {
+    // The worker repeats parent-side dimension limits as a process boundary
+    // defense against malformed or future-version requests.
     if width == 0 || height == 0 {
         return Err(ServerError::invalid_params(
             "capture dimensions must be > 0",
