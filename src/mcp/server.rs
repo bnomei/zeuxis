@@ -83,11 +83,11 @@ fn try_emit_platform_feedback_sound(capture_sound_file: Option<&std::path::Path>
 
     #[cfg(target_os = "linux")]
     {
-        return spawn_feedback_sound_process("canberra-gtk-play", &["-i", "camera-shutter"])
+        spawn_feedback_sound_process("canberra-gtk-play", &["-i", "camera-shutter"])
             || spawn_feedback_sound_process(
                 "paplay",
                 &["/usr/share/sounds/freedesktop/stereo/camera-shutter.oga"],
-            );
+            )
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -105,9 +105,9 @@ fn try_emit_custom_sound_file(path: &std::path::Path) -> bool {
 
     #[cfg(target_os = "linux")]
     {
-        return spawn_feedback_sound_process("paplay", &[&sound_path])
+        spawn_feedback_sound_process("paplay", &[&sound_path])
             || spawn_feedback_sound_process("aplay", &[&sound_path])
-            || spawn_feedback_sound_process("canberra-gtk-play", &["--file", &sound_path]);
+            || spawn_feedback_sound_process("canberra-gtk-play", &["--file", &sound_path])
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]

@@ -47,11 +47,13 @@ impl PermissionGate for PlatformPermissionGate {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 trait MacScreenCaptureAccess {
     fn preflight(&self) -> bool;
     fn request(&self) -> bool;
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn evaluate_macos_permission(api: &dyn MacScreenCaptureAccess) -> Result<(), ServerError> {
     if api.preflight() {
         return Ok(());
