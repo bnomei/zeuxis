@@ -105,6 +105,13 @@ pub struct StoredArtifact {
     pub captured_at_utc: String,
 }
 
+/// RAII guard for artifact paths that must survive retention pruning.
+pub trait ArtifactProtectionGuard: Send {}
+
+struct NoopArtifactProtectionGuard;
+
+impl ArtifactProtectionGuard for NoopArtifactProtectionGuard {}
+
 /// Artifact storage boundary for encoded screenshot files and session caches.
 ///
 /// Despite the historical name, implementations may store PNG, JPEG, or WebP.
@@ -125,6 +132,11 @@ pub trait PngStorage: Send + Sync {
         output: CaptureOutputOptions,
     ) -> Result<StoredArtifact, ServerError>;
 
+    /// Protects a not-yet-finalized artifact path from retention pruning.
+    fn protect_artifact_path(&self, _path: &Path) -> Box<dyn ArtifactProtectionGuard> {
+        Box::new(NoopArtifactProtectionGuard)
+    }
+
     /// Returns the latest artifact still present in the current server session.
     fn latest_artifact(&self) -> Result<StoredArtifact, ServerError>;
 
@@ -134,9 +146,7 @@ pub trait PngStorage: Send + Sync {
     /// Deletes known session artifacts and returns the number of files removed.
     fn clear_session_artifacts(&self) -> Result<usize, ServerError>;
 
-    /// Directory where managed artifacts are written. Worker subprocesses stage
-    /// captures here so `--artifact-dir`, retention pruning, and session bookkeeping
-    /// apply to worker output the same as inline captures.
+    /// Directory where managed artifacts are written and retention is applied.
     fn artifact_dir(&self) -> PathBuf;
 }
 
@@ -159,6 +169,8 @@ struct InFlightGuard {
     in_flight: Arc<Mutex<HashSet<PathBuf>>>,
     path: PathBuf,
 }
+
+impl ArtifactProtectionGuard for InFlightGuard {}
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
@@ -281,6 +293,10 @@ impl PngStorage for TempPngStorage {
 
     fn artifact_dir(&self) -> PathBuf {
         self.artifact_dir.clone()
+    }
+
+    fn protect_artifact_path(&self, path: &Path) -> Box<dyn ArtifactProtectionGuard> {
+        Box::new(self.register_in_flight(path))
     }
 
     fn adopt_artifact(
@@ -943,6 +959,51 @@ mod tests {
         assert!(
             sibling.exists(),
             "in-flight concurrent artifact must not be pruned"
+        );
+        assert!(current.exists(), "current artifact must remain");
+    }
+
+    #[test]
+    fn storage_protect_artifact_path_registers_path_until_guard_drops() {
+        let dir = tempdir().expect("tempdir");
+        let storage = TempPngStorage::with_settings(
+            1,
+            DEFAULT_MAX_ARTIFACT_BYTES,
+            Some(dir.path().to_path_buf()),
+            None,
+        );
+        let worker = write_artifact(dir.path(), "worker", 8);
+        let current = write_artifact(dir.path(), "current", 8);
+
+        {
+            let _guard = storage.protect_artifact_path(&worker);
+            prune_artifacts_in_dir(
+                dir.path(),
+                &current,
+                RetentionPolicy {
+                    max_artifacts: 1,
+                    max_total_bytes: u64::MAX,
+                },
+                &storage.in_flight_snapshot(),
+            );
+
+            assert!(worker.exists(), "protected worker artifact must remain");
+            assert!(current.exists(), "current artifact must remain");
+        }
+
+        prune_artifacts_in_dir(
+            dir.path(),
+            &current,
+            RetentionPolicy {
+                max_artifacts: 1,
+                max_total_bytes: u64::MAX,
+            },
+            &storage.in_flight_snapshot(),
+        );
+
+        assert!(
+            !worker.exists(),
+            "worker artifact should be prunable after guard drop"
         );
         assert!(current.exists(), "current artifact must remain");
     }

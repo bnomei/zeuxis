@@ -1164,6 +1164,7 @@ impl ZeuxisScreenshotServer {
                     capture_mode,
                     output_for_request.format.file_suffix(),
                 );
+                let _artifact_protection = storage.protect_artifact_path(&artifact_path);
                 let request_id = next_worker_request_id();
                 // The child writes encoded bytes to this path; the parent then
                 // adopts the artifact to centralize hashes, HMAC, retention, and
@@ -1192,8 +1193,16 @@ impl ZeuxisScreenshotServer {
                     }
                 };
 
-                // Worker child.wait already consumed worker_timeout; honor a successful
-                // response and bound only adoption, a fast local filesystem step.
+                let adoption_timeout = deadline.saturating_duration_since(Instant::now());
+                if adoption_timeout.is_zero() {
+                    let _ = cleanup_worker_artifact_path(Path::new(&worker_result.artifact_path));
+                    return result::error_result(&ServerError::storage_failed(
+                        timeout_message_for_worker.clone(),
+                    ));
+                }
+
+                // Keep adoption inside the original blocking timeout. The worker
+                // already consumed part of this deadline before returning.
                 let storage = Arc::clone(&storage);
                 let artifact_path = PathBuf::from(worker_result.artifact_path.clone());
                 let output_options = CaptureOutputOptions {
@@ -1201,7 +1210,7 @@ impl ZeuxisScreenshotServer {
                     jpeg_quality: output_for_request.jpeg_quality,
                 };
                 let adopted = run_blocking_with_timeout(
-                    worker_timeout,
+                    adoption_timeout,
                     timeout_message_for_worker.clone(),
                     "capture adopt worker task failed",
                     move || storage.adopt_artifact(artifact_path, capture_mode, output_options),
@@ -1332,8 +1341,9 @@ impl ZeuxisScreenshotServer {
         Ok(())
     }
 
-    /// Stages a worker capture under the storage artifact directory so adoption,
-    /// retention, and session caches track the file like inline captures.
+    /// Creates a managed worker artifact path under the storage artifact directory.
+    /// Callers hold storage protection before spawning the worker so retention
+    /// cannot prune the not-yet-adopted child output.
     fn create_worker_artifact_path(&self, capture_mode: &str, suffix: &str) -> PathBuf {
         let base = self.storage.artifact_dir();
         let _ = std::fs::create_dir_all(&base);
